@@ -170,7 +170,13 @@ class Config:
     LOG_DIR = './logs_40_60'
     LOG_LEVEL = logging.DEBUG
     ANALYSIS_DIR = './logs_40_60/analysis'
-    
+
+    # State persistence
+    STATE_FILE = './logs_40_60/bot_state.json'
+
+    # Drawdown auto-shutdown
+    MAX_DRAWDOWN_SHUTDOWN = 0.15  # 15% drawdown triggers auto-shutdown
+
     # Account Currency
     ACCOUNT_CURRENCY = 'GBP'
 
@@ -1719,15 +1725,16 @@ class EnhancedMarketAnalyzer:
             df = self.client.get_candles('USD_JPY', 'H1', count=24)
             if df.empty or len(df) < 24:
                 return "neutral"
-            
+
             change_pct = (df['close'].iloc[-1] / df['close'].iloc[0] - 1) * 100
             volatility = df['close'].pct_change().std() * 100
-            
-            if change_pct > 0.5 and volatility < 1.0:
+
+            # Loosened thresholds (were 0.5/1.0/1.5 — almost never triggered)
+            if change_pct > 0.25 and volatility < 0.8:
                 return "risk_on"
-            elif change_pct < -0.5 and volatility < 1.0:
+            elif change_pct < -0.25 and volatility < 0.8:
                 return "risk_off"
-            elif volatility > 1.5:
+            elif volatility > 0.8:
                 return "volatile"
             else:
                 return "neutral"
@@ -1763,16 +1770,21 @@ class EnhancedMarketAnalyzer:
                         rejections_down += 1
             
             bias = 0.0
-            
-            if current_price > vwap and buying_pressure > 0.6:
-                bias = buying_pressure
-            elif current_price < vwap and buying_pressure < 0.4:
-                bias = -(1 - buying_pressure)
-            
-            if rejections_up > 3:
-                bias -= 0.3
-            if rejections_down > 3:
-                bias += 0.3
+
+            # Calculate price position relative to VWAP as continuous value
+            if vwap > 0:
+                vwap_deviation = (current_price - vwap) / vwap * 10000  # In pips-like scale
+
+            # Loosened thresholds (were 0.6/0.4 — rarely triggered with M1 data)
+            if current_price > vwap and buying_pressure > 0.52:
+                bias = (buying_pressure - 0.5) * 2  # Scale 0.52-1.0 -> 0.04-1.0
+            elif current_price < vwap and buying_pressure < 0.48:
+                bias = -((0.5 - buying_pressure) * 2)  # Scale 0.0-0.48 -> -1.0 to -0.04
+
+            if rejections_up > 2:
+                bias -= 0.2
+            if rejections_down > 2:
+                bias += 0.2
             
             return np.clip(bias, -1.0, 1.0)
             
@@ -2229,6 +2241,7 @@ class EnhancedMarketAnalyzer:
 class EnhancedSignalGenerator:
     def __init__(self, analyzer: EnhancedMarketAnalyzer):
         self.analyzer = analyzer
+        self._last_signal_hash = {}  # For signal deduplication
         self.strategies = [
             self.momentum_pullback_signal,
             self.trend_following_signal,
@@ -2302,28 +2315,36 @@ class EnhancedSignalGenerator:
         return True, position_multiplier
 
     def generate_signals(self, symbol: str) -> Optional[Dict]:
-        """Generate trading signals with time window filtering"""
+        """Generate trading signals with time window filtering and deduplication"""
         market_condition = self.analyzer.get_market_condition(symbol)
-        
+
         if not market_condition['tradeable']:
             return None
-        
+
         # CHECK TIME WINDOW FILTER
         in_window, window_reason = is_in_trading_window()
         if not in_window:
             logger.debug(f"{symbol}: {window_reason}")
             return None
-        
+
         if abs(market_condition['multi_tf_bias']) < 0.5:
             logger.debug(f"{symbol}: Insufficient multi-timeframe alignment")
             return None
-        
+
+        # SIGNAL DEDUPLICATION — skip if indicators haven't changed since last signal
+        indicators = market_condition.get('indicators', {})
+        indicator_hash = f"{symbol}_{indicators.get('rsi', 0):.2f}_{indicators.get('macd', 0):.6f}_{indicators.get('atr', 0):.6f}"
+        if self._last_signal_hash.get(symbol) == indicator_hash:
+            logger.debug(f"{symbol}: Skipping — indicators unchanged since last signal")
+            return None
+        self._last_signal_hash[symbol] = indicator_hash
+
         # HURST REGIME FILTER — only trade in trending markets
         hurst = self.analyzer.compute_hurst_exponent(symbol)
         if hurst < Config.HURST_THRESHOLD:
             logger.info(f"{symbol}: Hurst {hurst:.3f} < {Config.HURST_THRESHOLD} — market not trending, skipping")
             return None
-        
+
         signals = []
         for strategy in self.strategies:
             try:
@@ -2503,28 +2524,36 @@ class EnhancedSignalGenerator:
     def trend_following_signal(self, symbol: str, market_condition: Dict) -> Optional[Dict]:
         if abs(market_condition['trend_strength']) < 0.3:
             return None
-        
+
         if abs(market_condition['multi_tf_bias']) < 0.5:
             return None
-        
+
         df = self.analyzer.get_market_data(symbol, Config.TIMEFRAMES['primary'])
         if df.empty or len(df) < 10:
             return None
-        
+
         latest = df.iloc[-1]
-        
+
+        # RSI exhaustion guard — don't buy into overbought or sell into oversold
+        if latest['rsi'] > 75:
+            logger.debug(f"{symbol}: RSI {latest['rsi']:.1f} > 75 — skipping buy signal (overbought)")
+            return None
+        if latest['rsi'] < 25:
+            logger.debug(f"{symbol}: RSI {latest['rsi']:.1f} < 25 — skipping sell signal (oversold)")
+            return None
+
         signal = None
         confidence = 0.5
-        
+
         if len(df) >= 2:
             prev = df.iloc[-2]
-            
+
             macd_cross_up = latest['macd'] > latest['macd_signal'] and prev['macd'] <= prev['macd_signal']
             macd_cross_down = latest['macd'] < latest['macd_signal'] and prev['macd'] >= prev['macd_signal']
-            
+
             momentum_up = latest['momentum'] > 0 and latest['rsi'] > 45
             momentum_down = latest['momentum'] < 0 and latest['rsi'] < 55
-            
+
             if market_condition['trend_direction'] == 'bullish' and market_condition['multi_tf_bias'] > 0:
                 if macd_cross_up or momentum_up:
                     signal = 'buy'
@@ -2532,7 +2561,7 @@ class EnhancedSignalGenerator:
                     if market_condition['order_flow'] > 0:
                         confidence += 0.1
                     confidence += market_condition['multi_tf_bias'] * 0.1
-                        
+
             elif market_condition['trend_direction'] == 'bearish' and market_condition['multi_tf_bias'] < 0:
                 if macd_cross_down or momentum_down:
                     signal = 'sell'
@@ -3103,10 +3132,123 @@ class EnhancedTradeExecutor:
         self.trailing_stops = {}
         self.excursion_trackers = {}
         self.closed_trades_tracked = set()
+        self.last_signal_hash = {}  # For signal deduplication
 
         # Initialize blocked trade tracker
         self.blocked_trade_tracker = BlockedTradeTracker(oanda_client, risk_manager)
         logger.info("✅ Blocked trade tracking enabled - Will analyze virtual outcomes with position sizing")
+
+        # Load persisted state from disk
+        self._load_state()
+
+    def _save_state(self):
+        """Persist critical state to disk so it survives restarts"""
+        try:
+            state = {
+                'closed_trades_tracked': list(self.closed_trades_tracked),
+                'trade_records': {},
+                'risk_manager': {
+                    'winning_trades': self.risk_manager.winning_trades,
+                    'losing_trades': self.risk_manager.losing_trades,
+                    'win_amounts': self.risk_manager.win_amounts[-100:],
+                    'loss_amounts': self.risk_manager.loss_amounts[-100:],
+                    'returns_history': self.risk_manager.returns_history[-252:],
+                    'daily_pnl': self.risk_manager.daily_pnl,
+                    'daily_trades': self.risk_manager.daily_trades,
+                    'last_reset': self.risk_manager.last_reset.isoformat(),
+                }
+            }
+            # Save trade records (only key fields needed for closed trade detection)
+            for tid, record in self.trade_records.items():
+                state['trade_records'][tid] = {
+                    'trade_id': record.trade_id,
+                    'symbol': record.symbol,
+                    'direction': record.direction,
+                    'strategy': record.strategy,
+                    'confidence': record.confidence,
+                    'entry_price': record.entry_price,
+                    'stop_loss': record.stop_loss,
+                    'take_profit': record.take_profit,
+                    'position_size': record.position_size,
+                    'risk_amount': record.risk_amount,
+                    'status': record.status,
+                    'entry_time': record.entry_time,
+                    'exit_time': record.exit_time,
+                    'exit_price': record.exit_price,
+                    'pnl': record.pnl,
+                    'pnl_pips': record.pnl_pips,
+                    'session': record.session,
+                    'timestamp': record.timestamp,
+                }
+
+            os.makedirs(os.path.dirname(Config.STATE_FILE), exist_ok=True)
+            with open(Config.STATE_FILE, 'w') as f:
+                json.dump(state, f, indent=2, default=str)
+            logger.debug("State persisted to disk")
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}", exc_info=True)
+
+    def _load_state(self):
+        """Load persisted state from disk on startup"""
+        if not os.path.exists(Config.STATE_FILE):
+            logger.info("No persisted state found — starting fresh")
+            return
+
+        try:
+            with open(Config.STATE_FILE, 'r') as f:
+                state = json.load(f)
+
+            # Restore closed trades tracking set
+            self.closed_trades_tracked = set(state.get('closed_trades_tracked', []))
+            logger.info(f"Restored {len(self.closed_trades_tracked)} closed trade IDs from state")
+
+            # Restore trade records
+            for tid, data in state.get('trade_records', {}).items():
+                self.trade_records[tid] = TradeRecord(
+                    timestamp=data.get('timestamp', ''),
+                    trade_id=data['trade_id'],
+                    symbol=data['symbol'],
+                    direction=data['direction'],
+                    strategy=data.get('strategy', 'unknown'),
+                    confidence=data.get('confidence', 0.0),
+                    entry_price=data['entry_price'],
+                    stop_loss=data.get('stop_loss', 0.0),
+                    take_profit=data.get('take_profit', 0.0),
+                    position_size=data.get('position_size', 0.0),
+                    risk_amount=data.get('risk_amount', 0.0),
+                    market_conditions={},
+                    indicators={},
+                    status=data.get('status', 'EXECUTED'),
+                    entry_time=data.get('entry_time'),
+                    exit_time=data.get('exit_time'),
+                    exit_price=data.get('exit_price'),
+                    pnl=data.get('pnl'),
+                    pnl_pips=data.get('pnl_pips'),
+                    session=data.get('session'),
+                )
+            logger.info(f"Restored {len(self.trade_records)} trade records from state")
+
+            # Restore risk manager stats
+            rm_state = state.get('risk_manager', {})
+            if rm_state:
+                self.risk_manager.winning_trades = rm_state.get('winning_trades', 0)
+                self.risk_manager.losing_trades = rm_state.get('losing_trades', 0)
+                self.risk_manager.win_amounts = rm_state.get('win_amounts', [])
+                self.risk_manager.loss_amounts = rm_state.get('loss_amounts', [])
+                self.risk_manager.returns_history = rm_state.get('returns_history', [])
+                self.risk_manager.daily_pnl = rm_state.get('daily_pnl', 0.0)
+                self.risk_manager.daily_trades = rm_state.get('daily_trades', 0)
+                last_reset = rm_state.get('last_reset')
+                if last_reset:
+                    try:
+                        self.risk_manager.last_reset = datetime.fromisoformat(last_reset).date()
+                    except (ValueError, TypeError):
+                        pass
+                logger.info(f"Restored risk manager: {self.risk_manager.winning_trades}W / "
+                           f"{self.risk_manager.losing_trades}L")
+
+        except Exception as e:
+            logger.error(f"Failed to load state (starting fresh): {e}", exc_info=True)
     
     def calculate_pnl_pips(self, symbol: str, entry_price: float, exit_price: float, direction: str) -> float:
         """Calculate P&L in pips"""
@@ -3397,7 +3539,13 @@ class EnhancedTradeExecutor:
                     'total_win': 0, 'total_loss': 0
                 }
             advanced_logger.strategy_performance[signal['strategy']]['total_trades'] += 1
-            
+
+            # Persist state after new trade opened
+            self._save_state()
+
+            # Log that this signal was traded (append to signals CSV)
+            self._log_signal_executed(signal, symbol, trade_id, actual_price)
+
             return True
         
         elif result and 'orderCreateTransaction' in result:
@@ -3540,82 +3688,133 @@ class EnhancedTradeExecutor:
                                 logger.info(f"Stop moved to breakeven for {trade_id}")
     
     def update_closed_trades(self):
-        """Check for recently closed trades and update records"""
+        """Check for recently closed trades and update records.
+        Queries OANDA for CLOSED trades explicitly to catch trades that closed
+        between cycles, and handles trades even if trade_records was lost on restart.
+        """
         try:
+            # Query CLOSED trades explicitly (default endpoint only returns OPEN)
             url = f"{Config.OANDA_API_URL}/v3/accounts/{self.client.account_id}/trades"
-            params = {'count': 50}
+            params = {'count': 50, 'state': 'ALL'}
             response = self.client.session.get(url, params=params)
-            
+
             if response.status_code == 200:
                 all_trades = response.json()['trades']
-                
+
                 for trade in all_trades:
                     trade_id = trade['id']
                     state = trade.get('state', 'UNKNOWN')
-                    
+
                     if state == 'CLOSED' and trade_id not in self.closed_trades_tracked:
                         self.closed_trades_tracked.add(trade_id)
-                        
+
+                        symbol = trade['instrument']
+                        entry_price = float(trade['price'])
+                        exit_price = float(trade.get('averageClosePrice', 0))
+                        pnl = float(trade.get('realizedPL', 0))
+                        units = float(trade.get('initialUnits', 0))
+                        direction = 'buy' if units > 0 else 'sell'
+                        open_time = trade.get('openTime', datetime.now().isoformat())
+                        close_time = trade.get('closeTime', datetime.now().isoformat())
+                        pnl_pips = self.calculate_pnl_pips(symbol, entry_price, exit_price, direction)
+                        exit_reason = self._determine_exit_reason(trade)
+
                         if trade_id in self.trade_records:
+                            # We have the full record — update it
                             record = self.trade_records[trade_id]
-                            
-                            record.exit_time = trade.get('closeTime', datetime.now().isoformat())
-                            record.exit_price = float(trade.get('averageClosePrice', 0))
-                            record.pnl = float(trade.get('realizedPL', 0))
-                            record.pnl_pips = self.calculate_pnl_pips(record.symbol, record.entry_price, record.exit_price, record.direction)
-                            record.exit_reason = self._determine_exit_reason(trade)
+                            record.exit_time = close_time
+                            record.exit_price = exit_price
+                            record.pnl = pnl
+                            record.pnl_pips = pnl_pips
+                            record.exit_reason = exit_reason
                             record.status = "CLOSED"
-                            
-                            # Calculate duration using entry_time (or timestamp as fallback)
-                            if record.exit_time and record.entry_time:
-                                try:
-                                    start = datetime.fromisoformat(record.entry_time.replace('T', ' ').replace('Z', ''))
-                                    end = datetime.fromisoformat(record.exit_time.replace('T', ' ').replace('Z', '').split('.')[0])
-                                    record.duration_minutes = int((end - start).total_seconds() / 60)
-                                except Exception as e:
-                                    logger.warning(f"Failed to calculate duration for {trade_id}: {e}")
-                                    record.duration_minutes = 0
-                            
-                            self.risk_manager.update_trade_stats(record.pnl, record.strategy)
-                            
-                            strategy = record.strategy
-                            if strategy in advanced_logger.strategy_performance:
-                                perf = advanced_logger.strategy_performance[strategy]
-                                if record.pnl > 0:
-                                    perf['wins'] += 1
-                                    perf['total_win'] += record.pnl
-                                else:
-                                    perf['losses'] += 1
-                                    perf['total_loss'] += abs(record.pnl)
-                                perf['pnl'] += record.pnl
-                            
-                            # Update MAE/MFE from excursion tracker if available
-                            if trade_id in self.excursion_trackers:
-                                tracker = self.excursion_trackers[trade_id]
-                                tracker.exit_price = record.exit_price
-                                tracker.exit_time = record.exit_time
+                        else:
+                            # Trade record lost (e.g., bot restarted) — reconstruct from OANDA data
+                            logger.warning(f"Trade {trade_id} not in memory — reconstructing from OANDA data")
+                            record = TradeRecord(
+                                timestamp=open_time,
+                                trade_id=trade_id,
+                                symbol=symbol,
+                                direction=direction,
+                                strategy='unknown_restart',
+                                confidence=0.0,
+                                entry_price=entry_price,
+                                stop_loss=0.0,
+                                take_profit=0.0,
+                                position_size=abs(units),
+                                risk_amount=0.0,
+                                market_conditions={},
+                                indicators={},
+                                status="CLOSED",
+                                entry_time=open_time,
+                                exit_time=close_time,
+                                exit_price=exit_price,
+                                pnl=pnl,
+                                pnl_pips=pnl_pips,
+                                exit_reason=exit_reason,
+                                session=None
+                            )
+                            self.trade_records[trade_id] = record
 
-                                # Calculate MAE/MFE in pips
-                                if 'JPY' in record.symbol:
-                                    record.max_favorable = tracker.max_favorable * 100
-                                    record.max_adverse = tracker.max_adverse * 100
-                                else:
-                                    record.max_favorable = tracker.max_favorable * 10000
-                                    record.max_adverse = tracker.max_adverse * 10000
+                        # Calculate duration
+                        if record.exit_time and record.entry_time:
+                            try:
+                                start = datetime.fromisoformat(record.entry_time.replace('T', ' ').replace('Z', ''))
+                                end = datetime.fromisoformat(record.exit_time.replace('T', ' ').replace('Z', '').split('.')[0])
+                                record.duration_minutes = int((end - start).total_seconds() / 60)
+                            except Exception as e:
+                                logger.warning(f"Failed to calculate duration for {trade_id}: {e}")
+                                record.duration_minutes = 0
 
-                            # Log to old format (for backward compatibility)
-                            advanced_logger.log_trade(record)
+                        # Update risk manager stats
+                        self.risk_manager.update_trade_stats(record.pnl, record.strategy)
 
-                            # ✅ ALSO LOG TO UNIFIED CSV - This is the main analysis file
-                            advanced_logger.log_complete_trade(record, is_blocked=False)
-                            logger.info(f"✅ Closed trade logged to unified CSV: {trade_id}")
-                            
-                            logger.info(f"Trade {trade_id} CLOSED: {record.symbol} "
-                                      f"P&L=£{record.pnl:.2f} ({record.pnl_pips:.1f} pips) "
-                                      f"Exit={record.exit_price:.5f} Reason={record.exit_reason}")
-                        
+                        # Update strategy performance
+                        strategy = record.strategy
+                        if strategy not in advanced_logger.strategy_performance:
+                            advanced_logger.strategy_performance[strategy] = {
+                                'wins': 0, 'losses': 0, 'pnl': 0, 'total_trades': 0,
+                                'total_win': 0, 'total_loss': 0
+                            }
+                        perf = advanced_logger.strategy_performance[strategy]
+                        perf['total_trades'] += 1
+                        if record.pnl > 0:
+                            perf['wins'] += 1
+                            perf['total_win'] += record.pnl
+                        else:
+                            perf['losses'] += 1
+                            perf['total_loss'] += abs(record.pnl)
+                        perf['pnl'] += record.pnl
+
+                        # Update MAE/MFE from excursion tracker if available
+                        if trade_id in self.excursion_trackers:
+                            tracker = self.excursion_trackers[trade_id]
+                            tracker.exit_price = record.exit_price
+                            tracker.exit_time = record.exit_time
+                            if 'JPY' in record.symbol:
+                                record.max_favorable = tracker.max_favorable * 100
+                                record.max_adverse = tracker.max_adverse * 100
+                            else:
+                                record.max_favorable = tracker.max_favorable * 10000
+                                record.max_adverse = tracker.max_adverse * 10000
+
+                        # Log to old format (for backward compatibility)
+                        advanced_logger.log_trade(record)
+
+                        # Log to unified CSV
+                        advanced_logger.log_complete_trade(record, is_blocked=False)
+                        logger.info(f"✅ Closed trade logged to unified CSV: {trade_id}")
+
+                        currency_symbol = '£' if Config.ACCOUNT_CURRENCY == 'GBP' else '$'
+                        logger.info(f"Trade {trade_id} CLOSED: {record.symbol} "
+                                  f"P&L={currency_symbol}{record.pnl:.2f} ({record.pnl_pips:.1f} pips) "
+                                  f"Exit={record.exit_price:.5f} Reason={record.exit_reason}")
+
+                        # Persist updated state to disk
+                        self._save_state()
+
         except Exception as e:
-            logger.error(f"Error updating closed trades: {e}")
+            logger.error(f"Error updating closed trades: {e}", exc_info=True)
     
     def _determine_exit_reason(self, trade: Dict) -> str:
         """Determine why a trade closed"""
@@ -3728,6 +3927,39 @@ class EnhancedTradeExecutor:
             return True
         return False
 
+    def _log_signal_executed(self, signal: Dict, symbol: str, trade_id: str, fill_price: float):
+        """Log that a signal was actually executed — fixes the signal logging gap"""
+        try:
+            data = {
+                'timestamp': datetime.now().isoformat(),
+                'symbol': symbol,
+                'strategy': signal['strategy'],
+                'direction': signal['direction'],
+                'confidence': signal['confidence'],
+                'entry_price': fill_price,
+                'stop_loss': signal['stop_loss'],
+                'take_profit': signal['take_profit'],
+                'risk_reward': signal.get('risk_reward', 0),
+                'market_conditions': json.dumps(signal.get('market_conditions', {})),
+                'indicators': json.dumps(signal.get('indicators', {})),
+                'traded': True,
+                'not_traded_reason': '',
+                'session': signal.get('session', ''),
+                'trade_id': trade_id,
+            }
+
+            filename = f"{Config.ANALYSIS_DIR}/signals_log.csv"
+            file_exists = os.path.exists(filename)
+            with open(filename, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=data.keys())
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(data)
+                f.flush()
+            logger.debug(f"Signal execution logged for {trade_id}")
+        except Exception as e:
+            logger.error(f"Failed to log signal execution: {e}")
+
 # ==================== MAIN BOT ====================
 class ProfessionalForexBot:
     def __init__(self):
@@ -3839,9 +4071,17 @@ class ProfessionalForexBot:
         drawdown = (self.performance_tracker['peak_balance'] - current_balance) / self.performance_tracker['peak_balance']
         if drawdown > self.performance_tracker['max_drawdown']:
             self.performance_tracker['max_drawdown'] = drawdown
-        
+
+        # Drawdown auto-shutdown
+        if drawdown >= Config.MAX_DRAWDOWN_SHUTDOWN:
+            logger.critical(f"DRAWDOWN AUTO-SHUTDOWN: {drawdown:.1%} >= {Config.MAX_DRAWDOWN_SHUTDOWN:.0%} threshold. "
+                          f"Peak: £{self.performance_tracker['peak_balance']:.2f}, "
+                          f"Current: £{current_balance:.2f}")
+            self.running = False
+            return
+
         session, session_quality = self.analyzer.get_current_session()
-        
+
         can_trade, reason = self.risk_manager.can_trade(current_balance, session_quality)
         if not can_trade:
             logger.info(f"Not trading: {reason}")
