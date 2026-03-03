@@ -977,6 +977,8 @@ def print_strategy_breakdown(results: List[dict]):
 # ─────────────────────────────────────────────────────────
 
 def main():
+    global MIN_SAMPLE_SIZE
+
     parser = argparse.ArgumentParser(description="Window Optimizer using bot's actual signal logic")
     parser.add_argument("--data-dir", required=True, help="Directory with parquet files")
     parser.add_argument("--start", default=None, help="Start date YYYY-MM-DD")
@@ -985,7 +987,6 @@ def main():
     parser.add_argument("--min-samples", type=int, default=MIN_SAMPLE_SIZE)
     args = parser.parse_args()
 
-    global MIN_SAMPLE_SIZE
     MIN_SAMPLE_SIZE = args.min_samples
 
     print("=" * 110)
