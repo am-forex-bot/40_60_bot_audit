@@ -2,27 +2,28 @@
 """
 30-Minute Window Optimizer for the 40/60 Bot
 
-Uses 5-second bid/ask parquet data to determine which 30-minute windows
-produce the best outcomes for the bot's TP+40 / SL-60 strategy.
+Uses the bot's ACTUAL signal generation logic (momentum pullback, trend following,
+volatility breakout) against 5-second parquet data resampled to M1/M5/M15/H1/H4.
 
-For each pair × window × direction:
-  - Simulates entry at the first 5s candle of each 30-min window
-  - Uses bid/ask prices for realistic execution
-  - Walks forward through 5s candles to find TP or SL hit
-  - Records outcome
+For each pair:
+  - Resamples 5s data to all timeframes the bot uses
+  - Evaluates the bot's signal logic at every M5 bar
+  - When a signal fires, simulates the trade using 5s bid/ask data
+  - Records outcome grouped by 30-minute window
 
 Cross-validates with train/test split to avoid curve-fitting.
+
+Requirements:
+    pip install pandas numpy pyarrow ta-lib
 
 Usage:
     python3 optimize_windows_5s.py --data-dir /path/to/parquet/files
 
-    # Faster: only use recent data (last 2 years)
+    # Recent data only
     python3 optimize_windows_5s.py --data-dir /path/to/parquets --start 2024-01-01
 
-    # Test specific pairs only
+    # Specific pairs
     python3 optimize_windows_5s.py --data-dir /path/to/parquets --pairs GBP_USD EUR_USD
-
-Expects parquet files named like: GBP_USD_S5_*.parquet
 """
 
 import argparse
@@ -37,649 +38,938 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+import talib
 
 
 # ─────────────────────────────────────────────────────────
-# Configuration
+# Bot's configuration (extracted from forex_bot_40_60.py)
 # ─────────────────────────────────────────────────────────
 
-# Pairs the bot trades
+TP_PIPS = 40
+SL_PIPS = 60
+CONFIDENCE_THRESHOLD = 0.60
+MIN_RISK_REWARD = 0.5
+RSI_PERIOD = 14
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+BB_PERIOD = 20
+BB_STDDEV = 2.0
+ATR_PERIOD = 14
+MIN_ATR_PIPS = 5
+MAX_ATR_PIPS = 100
+HURST_THRESHOLD = 0.52
+HURST_WINDOW = 100
+HURST_MIN_WINDOW = 10
+HURST_MAX_WINDOW = 50
+HURST_NUM_WINDOWS = 15
+
+# Max 5s candles to walk forward for TP/SL resolution
+MAX_FORWARD_5S = 50_000  # ~69 hours
+
+# Min samples for a window to be meaningful
+MIN_SAMPLE_SIZE = 30
+
+BREAKEVEN_WR = SL_PIPS / (TP_PIPS + SL_PIPS)  # 0.60
+
 ALL_PAIRS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD",
              "EUR_GBP", "GBP_JPY", "EUR_JPY", "AUD_JPY", "NZD_USD",
              "EUR_AUD", "GBP_AUD"]
 
-# The bot's actual TP/SL in pips
-TP_PIPS = 40
-SL_PIPS = 60
-
-# Max forward candles to check (50,000 × 5s ≈ 69 hours ≈ ~3 trading days)
-MAX_FORWARD_CANDLES = 50_000
-
-# Min trades per window to consider it statistically meaningful
-MIN_SAMPLE_SIZE = 50
-
-# Breakeven win rate for 40 TP / 60 SL
-BREAKEVEN_WR = SL_PIPS / (TP_PIPS + SL_PIPS)  # 0.60 = 60%
-
-# 48 windows: (hour, half_hour) → 00:00-00:29, 00:30-00:59, ...
-ALL_WINDOWS = [(h, hh) for h in range(24) for hh in range(2)]
+# Timeframe weights for multi-TF bias (from bot)
+TF_WEIGHTS = {'M1': 0.05, 'M5': 0.20, 'M15': 0.30, 'H1': 0.25, 'H4': 0.20}
 
 
-def pip_size(pair: str) -> float:
+def pip_val(pair: str) -> float:
     return 0.01 if "JPY" in pair else 0.0001
 
 
-def window_label(hour: int, half: int) -> str:
-    return f"{hour:02d}:{half*30:02d}-{hour:02d}:{half*30+29:02d}"
+def window_label(h: int, hh: int) -> str:
+    return f"{h:02d}:{hh*30:02d}-{h:02d}:{hh*30+29:02d}"
 
 
 # ─────────────────────────────────────────────────────────
-# Data loading
+# Data loading & resampling
 # ─────────────────────────────────────────────────────────
 
 def find_parquet(data_dir: str, pair: str) -> Optional[str]:
-    pattern = os.path.join(data_dir, f"{pair}_S5_*.parquet")
-    matches = glob.glob(pattern)
-    if matches:
-        return matches[0]
-    pattern2 = os.path.join(data_dir, f"{pair}*.parquet")
-    matches2 = glob.glob(pattern2)
-    return matches2[0] if matches2 else None
+    for pattern in [f"{pair}_S5_*.parquet", f"{pair}*.parquet"]:
+        matches = glob.glob(os.path.join(data_dir, pattern))
+        if matches:
+            return matches[0]
+    return None
 
 
-def load_pair_data(parquet_path: str, start_date: str = None, end_date: str = None) -> dict:
-    """
-    Load 5s data as numpy arrays for maximum performance.
-    Returns dict of numpy arrays: time, bid_high, bid_low, bid_close, ask_high, ask_low, ask_close, close.
-    """
+def load_5s(path: str, start: str = None, end: str = None) -> pd.DataFrame:
+    """Load 5s parquet with all columns needed."""
     filters = []
-    if start_date:
-        filters.append(("time", ">=", pd.Timestamp(start_date, tz="UTC")))
-    if end_date:
-        filters.append(("time", "<=", pd.Timestamp(end_date, tz="UTC")))
+    if start:
+        filters.append(("time", ">=", pd.Timestamp(start, tz="UTC")))
+    if end:
+        filters.append(("time", "<=", pd.Timestamp(end, tz="UTC")))
 
-    cols = ["time", "close", "bid_high", "bid_low", "bid_close", "ask_high", "ask_low", "ask_close"]
-    df = pq.read_table(parquet_path, filters=filters or None, columns=cols).to_pandas()
+    df = pq.read_table(path, filters=filters or None).to_pandas()
     df = df.sort_values("time").reset_index(drop=True)
-
-    # Convert time to numpy datetime64 for fast operations
-    return {
-        "time": df["time"].values,
-        "close": df["close"].values.astype(np.float64),
-        "bid_high": df["bid_high"].values.astype(np.float64),
-        "bid_low": df["bid_low"].values.astype(np.float64),
-        "bid_close": df["bid_close"].values.astype(np.float64),
-        "ask_high": df["ask_high"].values.astype(np.float64),
-        "ask_low": df["ask_low"].values.astype(np.float64),
-        "ask_close": df["ask_close"].values.astype(np.float64),
-        "n": len(df),
-    }
+    df = df.set_index("time")
+    return df
 
 
-# ─────────────────────────────────────────────────────────
-# Find entry points for each 30-min window
-# ─────────────────────────────────────────────────────────
+def resample_ohlcv(df_5s: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """Resample 5s data to a higher timeframe. freq: '1min','5min','15min','1h','4h'"""
+    ohlc = df_5s[["open", "high", "low", "close"]].resample(freq).agg({
+        "open": "first", "high": "max", "low": "min", "close": "last"
+    }).dropna()
 
-def find_window_entries(data: dict) -> List[dict]:
-    """
-    Find the first 5s candle at the start of each 30-minute window for each trading day.
-    Returns list of {window: (hour, half), idx: int, date: date, time: datetime64}.
-    """
-    times = data["time"]
-    n = data["n"]
+    if "volume" in df_5s.columns:
+        vol = df_5s["volume"].resample(freq).sum()
+        ohlc["volume"] = vol
+    else:
+        ohlc["volume"] = 0
 
-    # Convert to pandas for efficient datetime extraction
-    ts = pd.DatetimeIndex(times)
-    hours = ts.hour
-    minutes = ts.minute
-    dates = ts.date
-    weekdays = ts.weekday  # 0=Mon, 6=Sun
-
-    entries = []
-    seen = set()  # (date, hour, half) to avoid duplicates
-
-    for i in range(n):
-        # Skip weekends
-        if weekdays[i] >= 5:
-            continue
-
-        h = hours[i]
-        half = 0 if minutes[i] < 30 else 1
-        d = dates[i]
-        key = (d, h, half)
-
-        if key not in seen:
-            seen.add(key)
-            # Make sure there's enough forward data
-            if i + 5000 < n:  # At least ~7 hours of forward data
-                entries.append({
-                    "window": (h, half),
-                    "idx": i,
-                    "date": d,
-                })
-
-    return entries
+    return ohlc
 
 
 # ─────────────────────────────────────────────────────────
-# Simulate trades (vectorized per-trade)
+# Bot's indicator computation (exact copy from bot)
 # ─────────────────────────────────────────────────────────
 
-def simulate_entries(data: dict, entries: List[dict], pip: float) -> List[dict]:
-    """
-    For each entry point, simulate both BUY and SELL trades.
-    Uses numpy for speed.
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Exact replica of the bot's _add_indicators()"""
+    if len(df) < 26:
+        return df
 
-    BUY: enter at ask_close, exit checks against bid (TP: bid_high >= TP, SL: bid_low <= SL)
-    SELL: enter at bid_close, exit checks against ask (TP: ask_low <= TP, SL: ask_high >= SL)
+    close = df["close"].values.astype(np.float64)
+    high = df["high"].values.astype(np.float64)
+    low = df["low"].values.astype(np.float64)
+    vol = df["volume"].values.astype(np.float64) if "volume" in df.columns else np.ones(len(df))
+
+    df["sma_20"] = talib.SMA(close, timeperiod=20)
+    df["sma_50"] = talib.SMA(close, timeperiod=50)
+    df["ema_9"] = talib.EMA(close, timeperiod=9)
+    df["ema_21"] = talib.EMA(close, timeperiod=21)
+    df["rsi"] = talib.RSI(close, timeperiod=RSI_PERIOD)
+
+    macd, macd_sig, macd_hist = talib.MACD(close, fastperiod=MACD_FAST,
+                                            slowperiod=MACD_SLOW, signalperiod=MACD_SIGNAL)
+    df["macd"] = macd
+    df["macd_signal"] = macd_sig
+    df["macd_hist"] = macd_hist
+
+    upper, middle, lower = talib.BBANDS(close, timeperiod=BB_PERIOD,
+                                         nbdevup=BB_STDDEV, nbdevdn=BB_STDDEV)
+    df["bb_upper"] = upper
+    df["bb_middle"] = middle
+    df["bb_lower"] = lower
+
+    df["atr"] = talib.ATR(high, low, close, timeperiod=ATR_PERIOD)
+
+    stoch_k, stoch_d = talib.STOCH(high, low, close,
+                                     fastk_period=14, slowk_period=3, slowd_period=3)
+    df["stoch_k"] = stoch_k
+    df["stoch_d"] = stoch_d
+
+    df["momentum"] = df["close"] - df["close"].shift(10)
+    df["roc"] = talib.ROC(close, timeperiod=10)
+
+    if vol.sum() > 0:
+        df["volume_sma"] = talib.SMA(vol, timeperiod=20)
+        df["volume_ratio"] = np.where(df["volume_sma"] > 0, df["volume"] / df["volume_sma"], 1.0)
+    else:
+        df["volume_ratio"] = 1.0
+
+    return df
+
+
+# ─────────────────────────────────────────────────────────
+# Bot's analysis functions (exact replicas)
+# ─────────────────────────────────────────────────────────
+
+def get_timeframe_trend(df_tf: pd.DataFrame) -> float:
+    """Exact replica of bot's _get_timeframe_trend()"""
+    if df_tf.empty or len(df_tf) < 20:
+        return 0.0
+    latest = df_tf.iloc[-1]
+    if "ema_9" in df_tf.columns and "ema_21" in df_tf.columns:
+        if pd.notna(latest["ema_9"]) and pd.notna(latest["ema_21"]):
+            if latest["ema_9"] > latest["ema_21"] and latest["close"] > latest["ema_9"]:
+                return 1.0
+            elif latest["ema_9"] < latest["ema_21"] and latest["close"] < latest["ema_9"]:
+                return -1.0
+    return 0.0
+
+
+def get_multi_tf_bias(tf_dataframes: Dict[str, pd.DataFrame]) -> float:
+    """Exact replica of bot's get_multi_timeframe_bias()"""
+    weighted_bias = 0.0
+    total_weight = 0.0
+    for tf_name, weight in TF_WEIGHTS.items():
+        if tf_name in tf_dataframes:
+            trend = get_timeframe_trend(tf_dataframes[tf_name])
+            weighted_bias += trend * weight
+            total_weight += weight
+    if total_weight > 0 and total_weight != 1.0:
+        weighted_bias /= total_weight
+    return np.clip(weighted_bias, -1.0, 1.0)
+
+
+def calculate_trend_strength(df: pd.DataFrame) -> float:
+    """Exact replica of bot's _calculate_trend_strength()"""
+    if len(df) < 50:
+        return 0.0
+    latest = df.iloc[-1]
+    score = 0.0
+
+    if "ema_9" in df.columns and "ema_21" in df.columns:
+        if pd.notna(latest["ema_9"]) and pd.notna(latest["ema_21"]):
+            score += 0.3 if latest["ema_9"] > latest["ema_21"] else -0.3
+
+    if "sma_20" in df.columns and pd.notna(latest.get("sma_20")):
+        score += 0.2 if latest["close"] > latest["sma_20"] else -0.2
+
+    if "macd" in df.columns and "macd_signal" in df.columns:
+        if pd.notna(latest.get("macd")) and pd.notna(latest.get("macd_signal")):
+            score += 0.25 if latest["macd"] > latest["macd_signal"] else -0.25
+
+    if "momentum" in df.columns and pd.notna(latest.get("momentum")):
+        score += 0.25 if latest["momentum"] > 0 else -0.25
+
+    return np.clip(score, -1.0, 1.0)
+
+
+def compute_hurst(closes: np.ndarray) -> float:
+    """Exact replica of bot's compute_hurst_exponent() — data already provided."""
+    if len(closes) < HURST_WINDOW:
+        return 0.5
+
+    closes = closes[-HURST_WINDOW:]
+    returns = np.diff(np.log(closes))
+
+    if len(returns) < HURST_MIN_WINDOW * 2:
+        return 0.5
+
+    window_sizes = np.unique(np.logspace(
+        np.log10(HURST_MIN_WINDOW),
+        np.log10(min(HURST_MAX_WINDOW, len(returns) // 2)),
+        HURST_NUM_WINDOWS
+    ).astype(int))
+
+    if len(window_sizes) < 3:
+        return 0.5
+
+    rs_values = []
+    for w in window_sizes:
+        rs_list = []
+        n_windows = len(returns) // w
+        for i in range(n_windows):
+            chunk = returns[i * w:(i + 1) * w]
+            mean_chunk = np.mean(chunk)
+            deviations = np.cumsum(chunk - mean_chunk)
+            R = np.max(deviations) - np.min(deviations)
+            S = np.std(chunk, ddof=1)
+            if S > 1e-10:
+                rs_list.append(R / S)
+        if rs_list:
+            rs_values.append((w, np.mean(rs_list)))
+
+    if len(rs_values) < 3:
+        return 0.5
+
+    log_sizes = np.log(np.array([x[0] for x in rs_values]))
+    log_rs = np.log(np.array([x[1] for x in rs_values]))
+
+    n = len(log_sizes)
+    sum_x = np.sum(log_sizes)
+    sum_y = np.sum(log_rs)
+    sum_xy = np.sum(log_sizes * log_rs)
+    sum_x2 = np.sum(log_sizes ** 2)
+    denom = n * sum_x2 - sum_x ** 2
+    if abs(denom) < 1e-10:
+        return 0.5
+
+    hurst = float((n * sum_xy - sum_x * sum_y) / denom)
+    return float(np.clip(hurst, 0.0, 1.0))
+
+
+def get_order_flow_bias(df_m1: pd.DataFrame) -> float:
+    """Exact replica of bot's get_order_flow_bias() — uses last 60 M1 bars."""
+    if df_m1.empty or len(df_m1) < 60:
+        return 0.0
+
+    df = df_m1.iloc[-60:]
+    vwap = ((df["high"] + df["low"] + df["close"]) / 3).mean()
+    current_price = df["close"].iloc[-1]
+
+    buying_bars = len(df[df["close"] > df["open"]])
+    buying_pressure = buying_bars / len(df)
+
+    rejections_up = 0
+    rejections_down = 0
+    for i in range(-10, -1):
+        candle = df.iloc[i]
+        body = abs(candle["close"] - candle["open"])
+        upper_wick = candle["high"] - max(candle["close"], candle["open"])
+        lower_wick = min(candle["close"], candle["open"]) - candle["low"]
+        if body > 0:
+            if upper_wick > body * 2:
+                rejections_up += 1
+            if lower_wick > body * 2:
+                rejections_down += 1
+
+    bias = 0.0
+    if current_price > vwap and buying_pressure > 0.52:
+        bias = (buying_pressure - 0.5) * 2
+    elif current_price < vwap and buying_pressure < 0.48:
+        bias = -((0.5 - buying_pressure) * 2)
+
+    if rejections_up > 2:
+        bias -= 0.2
+    if rejections_down > 2:
+        bias += 0.2
+
+    return float(np.clip(bias, -1.0, 1.0))
+
+
+def get_session_quality(utc_hour: int, weekday: int) -> Tuple[str, float]:
+    """Replica of bot's get_current_session() using UTC hour."""
+    if weekday >= 5:
+        return "weekend", 0.0
+
+    # Approximate: UTC ≈ London time (close enough for GMT/BST overlap)
+    # Tokyo: 0-8 UTC, London: 7-16 UTC, NY: 13-21 UTC
+    tokyo_active = 0 <= utc_hour < 8
+    london_active = 7 <= utc_hour < 16
+    ny_active = 13 <= utc_hour < 21
+
+    if london_active and ny_active:
+        return "london_ny_overlap", 1.0
+    if tokyo_active and london_active:
+        return "tokyo_london_overlap", 0.85
+    if london_active:
+        return "london", 0.9
+    if ny_active:
+        return "ny", 0.8
+    if tokyo_active:
+        return "tokyo", 0.7
+    return "dead", 0.3
+
+
+# ─────────────────────────────────────────────────────────
+# Bot's signal strategies (exact replicas)
+# ─────────────────────────────────────────────────────────
+
+def momentum_pullback_signal(df_m5: pd.DataFrame, market: dict, pair: str) -> Optional[dict]:
+    """Exact replica of bot's momentum_pullback_signal()"""
+    if df_m5.empty or len(df_m5) < 20:
+        return None
+
+    latest = df_m5.iloc[-1]
+    if abs(market["multi_tf_bias"]) < 0.5:
+        return None
+
+    momentum = (df_m5["close"].iloc[-1] / df_m5["close"].iloc[-12] - 1)
+    pv = 100 if "JPY" in pair else 10000
+    momentum_pips = momentum * pv
+
+    if abs(momentum_pips) < 10:
+        return None
+
+    signal = None
+    confidence = 0.5
+    last_3 = df_m5.iloc[-3:]
+
+    if momentum_pips > 0 and market["multi_tf_bias"] > 0:
+        pullback = last_3["low"].min() < df_m5["close"].iloc[-4]
+        if pullback and latest["rsi"] < 70 and market["order_flow"] > -0.3:
+            signal = "buy"
+            confidence += 0.2
+            if market["session_quality"] > 0.8:
+                confidence += 0.1
+            if market["trend_direction"] == "bullish":
+                confidence += 0.1
+            confidence += market["multi_tf_bias"] * 0.1
+
+    elif momentum_pips < 0 and market["multi_tf_bias"] < 0:
+        pullback = last_3["high"].max() > df_m5["close"].iloc[-4]
+        if pullback and latest["rsi"] > 30 and market["order_flow"] < 0.3:
+            signal = "sell"
+            confidence += 0.2
+            if market["session_quality"] > 0.8:
+                confidence += 0.1
+            if market["trend_direction"] == "bearish":
+                confidence += 0.1
+            confidence += abs(market["multi_tf_bias"]) * 0.1
+
+    if not signal:
+        return None
+
+    return {"direction": signal, "strategy": "momentum_pullback",
+            "confidence": min(confidence, 0.95)}
+
+
+def trend_following_signal(df_m5: pd.DataFrame, market: dict, pair: str) -> Optional[dict]:
+    """Exact replica of bot's trend_following_signal()"""
+    if abs(market["trend_strength"]) < 0.3:
+        return None
+    if abs(market["multi_tf_bias"]) < 0.5:
+        return None
+    if df_m5.empty or len(df_m5) < 10:
+        return None
+
+    latest = df_m5.iloc[-1]
+    if latest["rsi"] > 75 or latest["rsi"] < 25:
+        return None
+
+    signal = None
+    confidence = 0.5
+
+    if len(df_m5) >= 2:
+        prev = df_m5.iloc[-2]
+        macd_cross_up = latest["macd"] > latest["macd_signal"] and prev["macd"] <= prev["macd_signal"]
+        macd_cross_down = latest["macd"] < latest["macd_signal"] and prev["macd"] >= prev["macd_signal"]
+        momentum_up = latest["momentum"] > 0 and latest["rsi"] > 45
+        momentum_down = latest["momentum"] < 0 and latest["rsi"] < 55
+
+        if market["trend_direction"] == "bullish" and market["multi_tf_bias"] > 0:
+            if macd_cross_up or momentum_up:
+                signal = "buy"
+                confidence += 0.3
+                if market["order_flow"] > 0:
+                    confidence += 0.1
+                confidence += market["multi_tf_bias"] * 0.1
+
+        elif market["trend_direction"] == "bearish" and market["multi_tf_bias"] < 0:
+            if macd_cross_down or momentum_down:
+                signal = "sell"
+                confidence += 0.3
+                if market["order_flow"] < 0:
+                    confidence += 0.1
+                confidence += abs(market["multi_tf_bias"]) * 0.1
+
+    if not signal:
+        return None
+
+    return {"direction": signal, "strategy": "trend_following",
+            "confidence": min(confidence, 0.95)}
+
+
+def volatility_breakout_signal(df_m5: pd.DataFrame, market: dict, pair: str) -> Optional[dict]:
+    """Exact replica of bot's volatility_breakout_signal()"""
+    if df_m5.empty or len(df_m5) < 20:
+        return None
+
+    latest = df_m5.iloc[-1]
+    recent_atr = df_m5["atr"].iloc[-5:].mean()
+    longer_atr = df_m5["atr"].iloc[-20:].mean()
+
+    if pd.isna(recent_atr) or pd.isna(longer_atr) or recent_atr <= longer_atr * 1.15:
+        return None
+
+    signal = None
+    confidence = 0.5
+
+    if pd.notna(latest.get("bb_upper")) and latest["close"] > latest["bb_upper"]:
+        signal = "buy"
+        confidence += 0.2
+        if 60 < latest["rsi"] < 80:
+            confidence += 0.1
+        if market["multi_tf_bias"] > 0:
+            confidence += 0.1
+    elif pd.notna(latest.get("bb_lower")) and latest["close"] < latest["bb_lower"]:
+        signal = "sell"
+        confidence += 0.2
+        if 20 < latest["rsi"] < 40:
+            confidence += 0.1
+        if market["multi_tf_bias"] < 0:
+            confidence += 0.1
+
+    if not signal:
+        return None
+
+    vr = latest.get("volume_ratio", 1.0)
+    if pd.notna(vr) and vr > 1.5:
+        confidence += 0.1
+
+    if (signal == "buy" and market["order_flow"] > 0) or \
+       (signal == "sell" and market["order_flow"] < 0):
+        confidence += 0.1
+
+    if confidence < CONFIDENCE_THRESHOLD:
+        return None
+
+    return {"direction": signal, "strategy": "volatility_breakout",
+            "confidence": min(confidence, 0.95)}
+
+
+# ─────────────────────────────────────────────────────────
+# Signal orchestrator (exact replica of bot's generate_signals)
+# ─────────────────────────────────────────────────────────
+
+def generate_signal(df_m5: pd.DataFrame, market: dict, pair: str) -> Optional[dict]:
     """
-    bid_high = data["bid_high"]
-    bid_low = data["bid_low"]
-    bid_close = data["bid_close"]
-    ask_high = data["ask_high"]
-    ask_low = data["ask_low"]
-    ask_close = data["ask_close"]
-    close_arr = data["close"]
-    n = data["n"]
+    Run all three active strategies, pick the best signal above confidence threshold.
+    Exact replica of the bot's generate_signals() minus API/logging/dedup.
+    """
+    # Pre-checks (from generate_signals)
+    if not market["tradeable"]:
+        return None
+    if abs(market["multi_tf_bias"]) < 0.5:
+        return None
+    if market["hurst"] < HURST_THRESHOLD:
+        return None
+
+    signals = []
+    for strategy_fn in [momentum_pullback_signal, trend_following_signal, volatility_breakout_signal]:
+        sig = strategy_fn(df_m5, market, pair)
+        if sig and sig["confidence"] >= CONFIDENCE_THRESHOLD:
+            # R/R for 40/60 is always 40/60 = 0.667, which passes MIN_RISK_REWARD of 0.5
+            sig["risk_reward"] = TP_PIPS / SL_PIPS
+            signals.append(sig)
+
+    if not signals:
+        return None
+
+    # Pick best by confidence × R/R (position_multiplier = 1.0 in backtest)
+    best = max(signals, key=lambda s: s["confidence"] * s["risk_reward"])
+    return best
+
+
+# ─────────────────────────────────────────────────────────
+# Trade simulation using 5s data
+# ─────────────────────────────────────────────────────────
+
+def simulate_trade_5s(direction: str, entry_idx: int, entry_price: float,
+                      bid_high: np.ndarray, bid_low: np.ndarray,
+                      ask_high: np.ndarray, ask_low: np.ndarray,
+                      pip: float, n_total: int) -> Optional[str]:
+    """
+    Simulate a single trade from entry_idx forward through 5s data.
+    Returns 'TP', 'SL', or None (unresolved).
+    """
+    max_fwd = min(MAX_FORWARD_5S, n_total - entry_idx)
+    if max_fwd < 100:
+        return None
 
     tp_dist = TP_PIPS * pip
     sl_dist = SL_PIPS * pip
 
+    if direction == "buy":
+        tp_level = entry_price + tp_dist
+        sl_level = entry_price - sl_dist
+        fwd_high = bid_high[entry_idx:entry_idx + max_fwd]
+        fwd_low = bid_low[entry_idx:entry_idx + max_fwd]
+    else:
+        tp_level = entry_price - tp_dist
+        sl_level = entry_price + sl_dist
+        fwd_high = ask_high[entry_idx:entry_idx + max_fwd]  # worst for short
+        fwd_low = ask_low[entry_idx:entry_idx + max_fwd]    # best for short
+
+    if direction == "buy":
+        tp_mask = fwd_high >= tp_level
+        sl_mask = fwd_low <= sl_level
+    else:
+        tp_mask = fwd_low <= tp_level
+        sl_mask = fwd_high >= sl_level
+
+    tp_idx = int(np.argmax(tp_mask)) if tp_mask.any() else max_fwd
+    sl_idx = int(np.argmax(sl_mask)) if sl_mask.any() else max_fwd
+
+    if not tp_mask.any():
+        tp_idx = max_fwd
+    if not sl_mask.any():
+        sl_idx = max_fwd
+
+    if tp_idx <= sl_idx and tp_idx < max_fwd:
+        return "TP"
+    elif sl_idx < max_fwd:
+        return "SL"
+    return None
+
+
+# ─────────────────────────────────────────────────────────
+# Main processing loop
+# ─────────────────────────────────────────────────────────
+
+def process_pair(pair: str, df_5s: pd.DataFrame) -> List[dict]:
+    """
+    Process one pair: resample, compute indicators on all timeframes,
+    evaluate signals at each M5 bar, simulate trades.
+    """
+    pip = pip_val(pair)
     results = []
 
-    for entry in entries:
-        idx = entry["idx"]
-        max_fwd = min(MAX_FORWARD_CANDLES, n - idx)
+    # ─── Resample to all timeframes ───
+    print(f"    Resampling to M1/M5/M15/H1/H4...", end="", flush=True)
+    t0 = time_mod.time()
 
-        # ─── BUY trade ───
-        buy_entry = ask_close[idx]
-        buy_tp = buy_entry + tp_dist
-        buy_sl = buy_entry - sl_dist
+    df_m1_full = resample_ohlcv(df_5s, "1min")
+    df_m5_full = resample_ohlcv(df_5s, "5min")
+    df_m15_full = resample_ohlcv(df_5s, "15min")
+    df_h1_full = resample_ohlcv(df_5s, "1h")
+    df_h4_full = resample_ohlcv(df_5s, "4h")
 
-        fwd_bid_high = bid_high[idx:idx + max_fwd]
-        fwd_bid_low = bid_low[idx:idx + max_fwd]
+    print(f" done ({time_mod.time()-t0:.1f}s)")
 
-        tp_mask = fwd_bid_high >= buy_tp
-        sl_mask = fwd_bid_low <= buy_sl
+    # ─── Add indicators to all timeframes ───
+    print(f"    Computing indicators on all timeframes...", end="", flush=True)
+    t0 = time_mod.time()
 
-        buy_tp_idx = int(np.argmax(tp_mask)) if tp_mask.any() else max_fwd
-        buy_sl_idx = int(np.argmax(sl_mask)) if sl_mask.any() else max_fwd
+    df_m1_full = add_indicators(df_m1_full)
+    df_m5_full = add_indicators(df_m5_full)
+    df_m15_full = add_indicators(df_m15_full)
+    df_h1_full = add_indicators(df_h1_full)
+    df_h4_full = add_indicators(df_h4_full)
 
-        # Fix argmax returning 0 when no True exists
-        if not tp_mask.any():
-            buy_tp_idx = max_fwd
-        if not sl_mask.any():
-            buy_sl_idx = max_fwd
+    print(f" done ({time_mod.time()-t0:.1f}s)")
 
-        if buy_tp_idx <= buy_sl_idx and buy_tp_idx < max_fwd:
-            buy_result = "TP"
-            buy_pips = TP_PIPS
-        elif buy_sl_idx < max_fwd:
-            buy_result = "SL"
-            buy_pips = -SL_PIPS
+    # ─── Prepare 5s arrays for fast simulation ───
+    bid_high_5s = df_5s["bid_high"].values.astype(np.float64)
+    bid_low_5s = df_5s["bid_low"].values.astype(np.float64)
+    ask_high_5s = df_5s["ask_high"].values.astype(np.float64)
+    ask_low_5s = df_5s["ask_low"].values.astype(np.float64)
+    ask_close_5s = df_5s["ask_close"].values.astype(np.float64)
+    bid_close_5s = df_5s["bid_close"].values.astype(np.float64)
+    times_5s = df_5s.index
+    n_5s = len(df_5s)
+
+    # Build a time → 5s index lookup for fast alignment
+    # Round 5s times to nearest second for matching
+    time_to_5s_idx = pd.Series(np.arange(n_5s), index=times_5s)
+
+    # ─── Pre-compute Hurst at each H1 bar ───
+    print(f"    Pre-computing Hurst exponents...", end="", flush=True)
+    t0 = time_mod.time()
+    h1_closes = df_h1_full["close"].values
+    hurst_by_h1_idx = {}
+    for i in range(HURST_WINDOW, len(h1_closes)):
+        hurst_by_h1_idx[i] = compute_hurst(h1_closes[:i+1])
+    print(f" done ({time_mod.time()-t0:.1f}s)")
+
+    # ─── Evaluate signal at each M5 bar ───
+    m5_times = df_m5_full.index
+    n_m5 = len(m5_times)
+    print(f"    Evaluating {n_m5:,} M5 bars...", end="", flush=True)
+    t0 = time_mod.time()
+
+    signals_found = 0
+    trades_simulated = 0
+    last_print = t0
+
+    for i in range(max(50, MACD_SLOW + MACD_SIGNAL), n_m5):
+        m5_time = m5_times[i]
+
+        # Progress
+        now = time_mod.time()
+        if now - last_print > 10:
+            elapsed = now - t0
+            pct = i / n_m5 * 100
+            rate = i / max(elapsed, 0.001)
+            eta = (n_m5 - i) / max(rate, 1)
+            print(f"\r    Evaluating {n_m5:,} M5 bars... {pct:.0f}% "
+                  f"({signals_found} signals, {trades_simulated} trades, ETA {eta:.0f}s)", end="", flush=True)
+            last_print = now
+
+        # Skip weekends
+        if m5_time.weekday() >= 5:
+            continue
+
+        # ─── Build market condition dict (replica of get_market_condition) ───
+
+        # Session quality
+        utc_hour = m5_time.hour
+        session, session_quality = get_session_quality(utc_hour, m5_time.weekday())
+        if session_quality <= 0.5:
+            continue
+
+        # M5 slice (last 200 bars up to current)
+        df_m5 = df_m5_full.iloc[max(0, i-199):i+1]
+        if len(df_m5) < 50:
+            continue
+
+        latest = df_m5.iloc[-1]
+
+        # ATR check
+        atr = latest.get("atr")
+        if pd.isna(atr) or atr == 0:
+            continue
+        atr_pips = atr * (100 if "JPY" in pair else 10000)
+        if not (MIN_ATR_PIPS <= atr_pips <= MAX_ATR_PIPS):
+            continue
+
+        # Multi-timeframe bias
+        # Get slices up to current time for each TF
+        m1_loc = df_m1_full.index.searchsorted(m5_time, side="right")
+        m15_loc = df_m15_full.index.searchsorted(m5_time, side="right")
+        h1_loc = df_h1_full.index.searchsorted(m5_time, side="right")
+        h4_loc = df_h4_full.index.searchsorted(m5_time, side="right")
+
+        tf_frames = {
+            "M1": df_m1_full.iloc[max(0, m1_loc-200):m1_loc],
+            "M5": df_m5,
+            "M15": df_m15_full.iloc[max(0, m15_loc-200):m15_loc],
+            "H1": df_h1_full.iloc[max(0, h1_loc-200):h1_loc],
+            "H4": df_h4_full.iloc[max(0, h4_loc-200):h4_loc],
+        }
+
+        mtf_bias = get_multi_tf_bias(tf_frames)
+
+        # Trend strength
+        trend_strength = calculate_trend_strength(df_m5)
+        trend_dir = "bullish" if trend_strength > 0.2 else "bearish" if trend_strength < -0.2 else "neutral"
+
+        # Order flow (M1 last 60 bars)
+        df_m1_slice = tf_frames["M1"]
+        order_flow = get_order_flow_bias(df_m1_slice)
+
+        # Hurst (use pre-computed from nearest H1 bar)
+        hurst = hurst_by_h1_idx.get(h1_loc - 1, 0.5) if h1_loc > 0 else 0.5
+
+        market = {
+            "tradeable": True,
+            "session": session,
+            "session_quality": session_quality,
+            "multi_tf_bias": mtf_bias,
+            "trend_strength": trend_strength,
+            "trend_direction": trend_dir,
+            "order_flow": order_flow,
+            "hurst": hurst,
+        }
+
+        # ─── Generate signal ───
+        sig = generate_signal(df_m5, market, pair)
+        if sig is None:
+            continue
+
+        signals_found += 1
+
+        # ─── Find entry point in 5s data ───
+        # Find the first 5s candle AT or AFTER this M5 bar's close time
+        entry_5s_idx = time_to_5s_idx.index.searchsorted(m5_time, side="left")
+        if entry_5s_idx >= n_5s - 100:
+            continue
+
+        # Entry price (ask for buy, bid for sell — matching bot's logic)
+        if sig["direction"] == "buy":
+            entry_price = ask_close_5s[entry_5s_idx]
         else:
-            buy_result = "OPEN"
-            buy_pips = 0
+            entry_price = bid_close_5s[entry_5s_idx]
 
-        # ─── SELL trade ───
-        sell_entry = bid_close[idx]
-        sell_tp = sell_entry - tp_dist
-        sell_sl = sell_entry + sl_dist
+        # ─── Simulate trade ───
+        result = simulate_trade_5s(
+            sig["direction"], entry_5s_idx, entry_price,
+            bid_high_5s, bid_low_5s, ask_high_5s, ask_low_5s,
+            pip, n_5s
+        )
 
-        fwd_ask_low = ask_low[idx:idx + max_fwd]
-        fwd_ask_high = ask_high[idx:idx + max_fwd]
+        if result is None:
+            continue
 
-        tp_mask_s = fwd_ask_low <= sell_tp
-        sl_mask_s = fwd_ask_high >= sell_sl
+        trades_simulated += 1
 
-        sell_tp_idx = int(np.argmax(tp_mask_s)) if tp_mask_s.any() else max_fwd
-        sell_sl_idx = int(np.argmax(sl_mask_s)) if sl_mask_s.any() else max_fwd
-
-        if not tp_mask_s.any():
-            sell_tp_idx = max_fwd
-        if not sl_mask_s.any():
-            sell_sl_idx = max_fwd
-
-        if sell_tp_idx <= sell_sl_idx and sell_tp_idx < max_fwd:
-            sell_result = "TP"
-            sell_pips = TP_PIPS
-        elif sell_sl_idx < max_fwd:
-            sell_result = "SL"
-            sell_pips = -SL_PIPS
-        else:
-            sell_result = "OPEN"
-            sell_pips = 0
-
-        # ─── Simple trend direction (EMA9 vs EMA21 on recent M5-equivalent closes) ───
-        # Use last 105 5s candles = ~8.75 min ≈ most recent M5 context
-        # Approximate EMA9 vs EMA21 using recent close averages
-        lookback_short = min(idx, 9 * 60)   # 9 M5 bars ≈ 540 5s candles
-        lookback_long = min(idx, 21 * 60)   # 21 M5 bars ≈ 1260 5s candles
-
-        if lookback_short > 60 and lookback_long > 60:
-            ema_short = close_arr[idx - lookback_short:idx].mean()
-            ema_long = close_arr[idx - lookback_long:idx].mean()
-            trend_dir = "buy" if ema_short > ema_long else "sell"
-        else:
-            trend_dir = None
-
-        # Trend-following result
-        if trend_dir == "buy":
-            trend_result = buy_result
-            trend_pips = buy_pips
-        elif trend_dir == "sell":
-            trend_result = sell_result
-            trend_pips = sell_pips
-        else:
-            trend_result = "SKIP"
-            trend_pips = 0
-
+        # Record result with window info
+        half = 0 if m5_time.minute < 30 else 1
         results.append({
-            "window": entry["window"],
-            "date": entry["date"],
-            "buy_result": buy_result,
-            "buy_pips": buy_pips,
-            "sell_result": sell_result,
-            "sell_pips": sell_pips,
-            "trend_dir": trend_dir,
-            "trend_result": trend_result,
-            "trend_pips": trend_pips,
+            "pair": pair,
+            "time": m5_time,
+            "date": m5_time.date(),
+            "window": (m5_time.hour, half),
+            "direction": sig["direction"],
+            "strategy": sig["strategy"],
+            "confidence": sig["confidence"],
+            "result": result,
+            "session": session,
+            "session_quality": session_quality,
+            "hurst": hurst,
+            "mtf_bias": mtf_bias,
         })
+
+    elapsed = time_mod.time() - t0
+    print(f"\r    Evaluated {n_m5:,} M5 bars in {elapsed:.0f}s — "
+          f"{signals_found} signals, {trades_simulated} trades simulated")
 
     return results
-
-
-# ─────────────────────────────────────────────────────────
-# Aggregation and analysis
-# ─────────────────────────────────────────────────────────
-
-def aggregate_results(results: List[dict], pair: str) -> dict:
-    """Aggregate results by window. Returns nested dict: window → stats."""
-    by_window = defaultdict(lambda: {
-        "buy_tp": 0, "buy_sl": 0, "buy_open": 0,
-        "sell_tp": 0, "sell_sl": 0, "sell_open": 0,
-        "trend_tp": 0, "trend_sl": 0, "trend_open": 0, "trend_skip": 0,
-        "dates": [],
-    })
-
-    for r in results:
-        w = r["window"]
-        d = by_window[w]
-        d["dates"].append(r["date"])
-
-        if r["buy_result"] == "TP":
-            d["buy_tp"] += 1
-        elif r["buy_result"] == "SL":
-            d["buy_sl"] += 1
-        else:
-            d["buy_open"] += 1
-
-        if r["sell_result"] == "TP":
-            d["sell_tp"] += 1
-        elif r["sell_result"] == "SL":
-            d["sell_sl"] += 1
-        else:
-            d["sell_open"] += 1
-
-        if r["trend_result"] == "TP":
-            d["trend_tp"] += 1
-        elif r["trend_result"] == "SL":
-            d["trend_sl"] += 1
-        elif r["trend_result"] == "SKIP":
-            d["trend_skip"] += 1
-        else:
-            d["trend_open"] += 1
-
-    return dict(by_window)
-
-
-def compute_window_stats(agg: dict) -> List[dict]:
-    """Compute stats for each window from aggregated data."""
-    stats = []
-    for window, d in agg.items():
-        buy_total = d["buy_tp"] + d["buy_sl"]
-        sell_total = d["sell_tp"] + d["sell_sl"]
-        trend_total = d["trend_tp"] + d["trend_sl"]
-
-        buy_wr = d["buy_tp"] / buy_total if buy_total > 0 else 0
-        sell_wr = d["sell_tp"] / sell_total if sell_total > 0 else 0
-        trend_wr = d["trend_tp"] / trend_total if trend_total > 0 else 0
-
-        # Expected value per trade in pips
-        buy_ev = buy_wr * TP_PIPS - (1 - buy_wr) * SL_PIPS if buy_total > 0 else 0
-        sell_ev = sell_wr * TP_PIPS - (1 - sell_wr) * SL_PIPS if sell_total > 0 else 0
-        trend_ev = trend_wr * TP_PIPS - (1 - trend_wr) * SL_PIPS if trend_total > 0 else 0
-
-        # "Best direction" = pick whichever direction has higher EV
-        if buy_ev >= sell_ev:
-            best_dir = "BUY"
-            best_wr = buy_wr
-            best_ev = buy_ev
-            best_n = buy_total
-        else:
-            best_dir = "SELL"
-            best_wr = sell_wr
-            best_ev = sell_ev
-            best_n = sell_total
-
-        stats.append({
-            "window": window,
-            "label": window_label(*window),
-            "buy_wr": buy_wr, "buy_ev": buy_ev, "buy_n": buy_total,
-            "sell_wr": sell_wr, "sell_ev": sell_ev, "sell_n": sell_total,
-            "trend_wr": trend_wr, "trend_ev": trend_ev, "trend_n": trend_total,
-            "best_dir": best_dir, "best_wr": best_wr, "best_ev": best_ev, "best_n": best_n,
-        })
-
-    stats.sort(key=lambda s: s["trend_ev"], reverse=True)
-    return stats
-
-
-# ─────────────────────────────────────────────────────────
-# Cross-validation
-# ─────────────────────────────────────────────────────────
-
-def cross_validate(results: List[dict]) -> Tuple[List[dict], List[dict]]:
-    """
-    Split results into train (first 70%) and test (last 30%) by date.
-    For each window, find best direction on train, evaluate on test.
-    """
-    all_dates = sorted(set(r["date"] for r in results))
-    split_idx = int(len(all_dates) * 0.7)
-    train_dates = set(all_dates[:split_idx])
-    test_dates = set(all_dates[split_idx:])
-
-    train = [r for r in results if r["date"] in train_dates]
-    test = [r for r in results if r["date"] in test_dates]
-
-    return train, test
 
 
 # ─────────────────────────────────────────────────────────
 # Reporting
 # ─────────────────────────────────────────────────────────
 
-def print_pair_report(pair: str, stats: List[dict]):
-    """Print window ranking for one pair."""
-    print(f"\n{'='*110}")
-    print(f"  {pair} — Window Rankings (sorted by trend-following EV)")
-    print(f"{'='*110}")
-    print(f"  {'Window':<14} {'Trend':>6} {'Trend':>6} {'Trend':>7} │ "
-          f"{'Buy':>6} {'Buy':>7} │ {'Sell':>6} {'Sell':>7} │ {'Best':>4} {'Best':>6} {'Best':>7} │ {'N':>5}")
-    print(f"  {'':.<14} {'WR%':>6} {'EV':>6} {'N':>7} │ "
-          f"{'WR%':>6} {'EV':>7} │ {'WR%':>6} {'EV':>7} │ {'Dir':>4} {'WR%':>6} {'EV':>7} │ {'tot':>5}")
-    print(f"  {'-'*107}")
+def print_window_ranking(results: List[dict], title: str = ""):
+    """Print window rankings from results."""
+    if not results:
+        print(f"  No results to display.")
+        return []
 
-    for s in stats:
-        trend_marker = " ***" if s["trend_ev"] > 0 and s["trend_n"] >= MIN_SAMPLE_SIZE else ""
-        buy_marker = "+" if s["buy_ev"] > 0 and s["buy_n"] >= MIN_SAMPLE_SIZE else ""
-        sell_marker = "+" if s["sell_ev"] > 0 and s["sell_n"] >= MIN_SAMPLE_SIZE else ""
+    by_window = defaultdict(lambda: {"tp": 0, "sl": 0, "pairs": defaultdict(lambda: {"tp": 0, "sl": 0}),
+                                      "strategies": defaultdict(lambda: {"tp": 0, "sl": 0})})
 
-        print(f"  {s['label']:<14} "
-              f"{s['trend_wr']*100:>5.1f}% {s['trend_ev']:>+6.1f} {s['trend_n']:>7} │ "
-              f"{s['buy_wr']*100:>5.1f}% {s['buy_ev']:>+6.1f}{buy_marker} │ "
-              f"{s['sell_wr']*100:>5.1f}% {s['sell_ev']:>+6.1f}{sell_marker} │ "
-              f"{s['best_dir']:>4} {s['best_wr']*100:>5.1f}% {s['best_ev']:>+6.1f} │ "
-              f"{s['buy_n'] + s['sell_n']:>5}"
-              f"{trend_marker}")
+    for r in results:
+        w = r["window"]
+        d = by_window[w]
+        if r["result"] == "TP":
+            d["tp"] += 1
+            d["pairs"][r["pair"]]["tp"] += 1
+            d["strategies"][r["strategy"]]["tp"] += 1
+        else:
+            d["sl"] += 1
+            d["pairs"][r["pair"]]["sl"] += 1
+            d["strategies"][r["strategy"]]["sl"] += 1
 
-
-def print_cross_validation(pair: str, train_stats: List[dict], test_stats: List[dict]):
-    """Show how train-period winners performed in test period."""
-    print(f"\n  Cross-Validation for {pair} (train: first 70% of dates, test: last 30%):")
-    print(f"  {'Window':<14} {'Train EV':>9} {'Train WR':>9} │ {'Test EV':>9} {'Test WR':>9} │ {'Validated?':>12}")
-    print(f"  {'-'*70}")
-
-    # Get top windows from training
-    train_map = {s["window"]: s for s in train_stats}
-    test_map = {s["window"]: s for s in test_stats}
-
-    # Sort by trend EV on training data
-    ranked = sorted(train_stats, key=lambda s: s["trend_ev"], reverse=True)
-
-    for s in ranked[:15]:  # Top 15
-        w = s["window"]
-        test_s = test_map.get(w, {})
-        test_ev = test_s.get("trend_ev", 0)
-        test_wr = test_s.get("trend_wr", 0)
-        test_n = test_s.get("trend_n", 0)
-
-        validated = "YES" if test_ev > 0 and test_n >= 20 else ("maybe" if test_ev > 0 else "NO")
-        print(f"  {s['label']:<14} {s['trend_ev']:>+8.1f}p {s['trend_wr']*100:>7.1f}% │ "
-              f"{test_ev:>+8.1f}p {test_wr*100:>7.1f}% │ {validated:>12}")
-
-
-def print_global_ranking(all_pair_stats: Dict[str, List[dict]], all_pair_results: Dict[str, List[dict]]):
-    """
-    Aggregate across all pairs to find globally optimal windows.
-    """
-    print("\n" + "=" * 120)
-    print("GLOBAL WINDOW RANKING (Aggregated Across All Pairs)")
-    print("=" * 120)
-
-    # For each window, aggregate across pairs
-    global_windows = defaultdict(lambda: {
-        "trend_tp": 0, "trend_sl": 0, "trend_total": 0,
-        "buy_tp": 0, "buy_sl": 0, "buy_total": 0,
-        "sell_tp": 0, "sell_sl": 0, "sell_total": 0,
-        "pair_evs": [],  # EV per pair for this window
-    })
-
-    for pair, results in all_pair_results.items():
-        pair_agg = aggregate_results(results, pair)
-        for window, d in pair_agg.items():
-            g = global_windows[window]
-            g["trend_tp"] += d["trend_tp"]
-            g["trend_sl"] += d["trend_sl"]
-            g["trend_total"] += d["trend_tp"] + d["trend_sl"]
-            g["buy_tp"] += d["buy_tp"]
-            g["buy_sl"] += d["buy_sl"]
-            g["buy_total"] += d["buy_tp"] + d["buy_sl"]
-            g["sell_tp"] += d["sell_tp"]
-            g["sell_sl"] += d["sell_sl"]
-            g["sell_total"] += d["sell_tp"] + d["sell_sl"]
-
-            # Per-pair trend EV for this window
-            t_total = d["trend_tp"] + d["trend_sl"]
-            if t_total > 0:
-                t_wr = d["trend_tp"] / t_total
-                t_ev = t_wr * TP_PIPS - (1 - t_wr) * SL_PIPS
-                g["pair_evs"].append((pair, t_ev, t_total))
-
-    # Compute global stats
-    global_stats = []
-    for window, g in global_windows.items():
-        trend_wr = g["trend_tp"] / g["trend_total"] if g["trend_total"] > 0 else 0
-        trend_ev = trend_wr * TP_PIPS - (1 - trend_wr) * SL_PIPS if g["trend_total"] > 0 else 0
-        buy_wr = g["buy_tp"] / g["buy_total"] if g["buy_total"] > 0 else 0
-        buy_ev = buy_wr * TP_PIPS - (1 - buy_wr) * SL_PIPS if g["buy_total"] > 0 else 0
-        sell_wr = g["sell_tp"] / g["sell_total"] if g["sell_total"] > 0 else 0
-        sell_ev = sell_wr * TP_PIPS - (1 - sell_wr) * SL_PIPS if g["sell_total"] > 0 else 0
-
-        # How many pairs are profitable in this window?
-        pairs_positive = sum(1 for _, ev, _ in g["pair_evs"] if ev > 0)
-        pairs_total = len(g["pair_evs"])
-
-        global_stats.append({
-            "window": window,
-            "label": window_label(*window),
-            "trend_wr": trend_wr, "trend_ev": trend_ev, "trend_n": g["trend_total"],
-            "buy_wr": buy_wr, "buy_ev": buy_ev, "buy_n": g["buy_total"],
-            "sell_wr": sell_wr, "sell_ev": sell_ev, "sell_n": g["sell_total"],
-            "pairs_positive": pairs_positive, "pairs_total": pairs_total,
-            "pair_evs": g["pair_evs"],
+    stats = []
+    for window, d in by_window.items():
+        total = d["tp"] + d["sl"]
+        wr = d["tp"] / total if total > 0 else 0
+        ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
+        pairs_positive = sum(1 for p, pd in d["pairs"].items()
+                            if (pd["tp"] / (pd["tp"] + pd["sl"])) > BREAKEVEN_WR
+                            and (pd["tp"] + pd["sl"]) >= 5)
+        stats.append({
+            "window": window, "label": window_label(*window),
+            "wr": wr, "ev": ev, "n": total, "tp": d["tp"], "sl": d["sl"],
+            "pairs_positive": pairs_positive,
+            "pairs_total": len(d["pairs"]),
+            "pair_details": dict(d["pairs"]),
+            "strategy_details": dict(d["strategies"]),
         })
 
-    global_stats.sort(key=lambda s: s["trend_ev"], reverse=True)
+    stats.sort(key=lambda s: s["ev"], reverse=True)
 
-    print(f"\n  {'Window':<14} {'Trend':>6} {'Trend':>7} {'Trend':>7} │ "
-          f"{'Buy':>6} {'Buy':>7} │ {'Sell':>6} {'Sell':>7} │ "
-          f"{'Pairs+':>6} │ {'Status':>12}")
-    print(f"  {'':.<14} {'WR%':>6} {'EV(p)':>7} {'N':>7} │ "
-          f"{'WR%':>6} {'EV(p)':>7} │ {'WR%':>6} {'EV(p)':>7} │ "
-          f"{'/ Tot':>6} │")
-    print(f"  {'-'*100}")
+    print(f"\n{'='*110}")
+    print(f"  {title}")
+    print(f"  Breakeven WR for TP+{TP_PIPS}/SL-{SL_PIPS}: {BREAKEVEN_WR*100:.0f}%")
+    print(f"{'='*110}")
+    print(f"  {'Window':<14} {'WR%':>6} {'EV(p)':>7} {'Trades':>7} {'TP':>5} {'SL':>5} "
+          f"{'Pairs+':>6} {'Status':>12}")
+    print(f"  {'-'*75}")
 
-    for s in global_stats:
-        # Status based on EV and sample size
-        if s["trend_ev"] > 0 and s["trend_n"] >= MIN_SAMPLE_SIZE * 2:
+    for s in stats:
+        if s["ev"] > 0 and s["n"] >= MIN_SAMPLE_SIZE:
             status = "PROFITABLE"
-        elif s["trend_ev"] > 0:
+        elif s["ev"] > 0:
             status = "positive"
-        elif s["trend_ev"] > -5:
+        elif s["ev"] > -5:
             status = "marginal"
         else:
-            status = "AVOID"
+            status = "avoid"
 
-        print(f"  {s['label']:<14} "
-              f"{s['trend_wr']*100:>5.1f}% {s['trend_ev']:>+6.1f}p {s['trend_n']:>7} │ "
-              f"{s['buy_wr']*100:>5.1f}% {s['buy_ev']:>+6.1f}p │ "
-              f"{s['sell_wr']*100:>5.1f}% {s['sell_ev']:>+6.1f}p │ "
-              f"{s['pairs_positive']:>3}/{s['pairs_total']:<2} │ "
-              f"{status:>12}")
+        marker = " ***" if status == "PROFITABLE" else ""
+        print(f"  {s['label']:<14} {s['wr']*100:>5.1f}% {s['ev']:>+6.1f}p {s['n']:>7} "
+              f"{s['tp']:>5} {s['sl']:>5} "
+              f"{s['pairs_positive']:>3}/{s['pairs_total']:<2} "
+              f"{status:>12}{marker}")
 
-    # ─── Recommended collection ───
-    print(f"\n{'='*120}")
-    print("RECOMMENDED WINDOW COLLECTION")
-    print("Windows with positive trend-following EV and sufficient sample size")
-    print(f"Breakeven win rate for TP+40/SL-60: {BREAKEVEN_WR*100:.0f}%")
-    print(f"{'='*120}")
+    return stats
 
-    profitable = [s for s in global_stats
-                  if s["trend_ev"] > 0 and s["trend_n"] >= MIN_SAMPLE_SIZE]
+
+def print_recommended_config(stats: List[dict], all_results: List[dict]):
+    """Print the validated window config."""
+    profitable = [s for s in stats if s["ev"] > 0 and s["n"] >= MIN_SAMPLE_SIZE]
 
     if not profitable:
-        print("\n  No windows meet the criteria. Lowering sample size requirement...")
-        profitable = [s for s in global_stats if s["trend_ev"] > 0 and s["trend_n"] >= 20]
+        print("\n  No windows meet profitability + sample size criteria.")
+        profitable = [s for s in stats if s["ev"] > 0 and s["n"] >= 10]
+        if not profitable:
+            print("  No windows with positive EV at all.")
+            return
 
-    print(f"\n  Found {len(profitable)} profitable windows:\n")
+    # Cross-validate
+    all_dates = sorted(set(r["date"] for r in all_results))
+    split = int(len(all_dates) * 0.7)
+    train_dates = set(all_dates[:split])
+    test_dates = set(all_dates[split:])
 
-    cumulative_tp = 0
-    cumulative_sl = 0
-    print(f"  {'#':>3} {'Window':<14} {'WR%':>6} {'EV':>7} {'N':>6} │ "
-          f"{'Cum WR%':>7} {'Cum EV':>7} {'Cum N':>6} │ {'Pairs profitable'}")
-    print(f"  {'-'*95}")
+    print(f"\n{'='*110}")
+    print(f"  CROSS-VALIDATION (Train: first 70% = {len(train_dates)} days, Test: last 30% = {len(test_dates)} days)")
+    print(f"{'='*110}")
+    print(f"  {'Window':<14} {'Full WR':>7} {'Full EV':>8} {'Full N':>7} │ "
+          f"{'Train WR':>8} {'Train EV':>9} │ {'Test WR':>8} {'Test EV':>9} │ {'Valid?':>8}")
+    print(f"  {'-'*100}")
 
-    for i, s in enumerate(profitable):
-        # Get trend TP/SL counts
-        trend_tp = int(s["trend_wr"] * s["trend_n"])
-        trend_sl = s["trend_n"] - trend_tp
-        cumulative_tp += trend_tp
-        cumulative_sl += trend_sl
-        cum_total = cumulative_tp + cumulative_sl
-        cum_wr = cumulative_tp / cum_total if cum_total > 0 else 0
-        cum_ev = cum_wr * TP_PIPS - (1 - cum_wr) * SL_PIPS
-
-        pair_str = ", ".join(f"{p}({ev:+.0f})" for p, ev, n in sorted(s["pair_evs"], key=lambda x: -x[1]) if ev > 0)
-
-        print(f"  {i+1:>3} {s['label']:<14} "
-              f"{s['trend_wr']*100:>5.1f}% {s['trend_ev']:>+6.1f}p {s['trend_n']:>6} │ "
-              f"{cum_wr*100:>6.1f}% {cum_ev:>+6.1f}p {cum_total:>6} │ "
-              f"{pair_str[:60]}")
-
-    # ─── Python config output ───
-    if profitable:
-        print(f"\n\n  # Paste this into the bot's Config class:")
-        print(f"  USE_TIME_WINDOWS = True")
-        print(f"  TRADE_WINDOWS = [")
-        for s in profitable:
-            h, hh = s["window"]
-            print(f"      ({h}, {hh}),  # {s['label']}: EV={s['trend_ev']:+.1f}p, "
-                  f"WR={s['trend_wr']*100:.0f}%, N={s['trend_n']}")
-        print(f"  ]")
-
-    # ─── Show per-pair breakdown for top windows ───
-    print(f"\n\n{'='*120}")
-    print("PER-PAIR BREAKDOWN FOR TOP WINDOWS")
-    print(f"{'='*120}")
-
-    for s in profitable[:10]:
-        print(f"\n  {s['label']}:")
-        for pair_name, ev, n in sorted(s["pair_evs"], key=lambda x: -x[1]):
-            wr = (ev + SL_PIPS) / (TP_PIPS + SL_PIPS)
-            bar = "+" * max(0, int(ev / 2)) if ev > 0 else "-" * max(0, int(-ev / 2))
-            print(f"    {pair_name:<10} EV={ev:>+6.1f}p  WR={wr*100:>5.1f}%  N={n:>5}  {bar}")
-
-    return profitable
-
-
-def print_global_cross_validation(all_pair_results: Dict[str, List[dict]], profitable_windows: List[dict]):
-    """Cross-validate the recommended windows across all pairs combined."""
-    print(f"\n\n{'='*120}")
-    print("CROSS-VALIDATION (Train: first 70%, Test: last 30%)")
-    print(f"{'='*120}")
-
-    # Combine all results across pairs
-    all_results_combined = []
-    for pair, results in all_pair_results.items():
-        for r in results:
-            r_copy = dict(r)
-            r_copy["pair"] = pair
-            all_results_combined.append(r_copy)
-
-    all_dates = sorted(set(r["date"] for r in all_results_combined))
-    split_idx = int(len(all_dates) * 0.7)
-    train_dates = set(all_dates[:split_idx])
-    test_dates = set(all_dates[split_idx:])
-
-    print(f"  Train period: {min(all_dates)} to {sorted(train_dates)[-1]} ({len(train_dates)} days)")
-    print(f"  Test period:  {sorted(test_dates)[0]} to {max(all_dates)} ({len(test_dates)} days)")
-
-    train = [r for r in all_results_combined if r["date"] in train_dates]
-    test = [r for r in all_results_combined if r["date"] in test_dates]
-
-    # For each profitable window, compute train and test EV
-    print(f"\n  {'Window':<14} {'Train WR':>8} {'Train EV':>9} {'Train N':>8} │ "
-          f"{'Test WR':>8} {'Test EV':>9} {'Test N':>8} │ {'Valid?':>8}")
-    print(f"  {'-'*90}")
-
-    validated_count = 0
-    for s in profitable_windows[:15]:
+    validated = []
+    for s in profitable:
         w = s["window"]
+        train_r = [r for r in all_results if r["window"] == w and r["date"] in train_dates]
+        test_r = [r for r in all_results if r["window"] == w and r["date"] in test_dates]
 
-        # Train stats
-        train_w = [r for r in train if r["window"] == w and r["trend_result"] in ("TP", "SL")]
-        train_tp = sum(1 for r in train_w if r["trend_result"] == "TP")
-        train_n = len(train_w)
+        train_tp = sum(1 for r in train_r if r["result"] == "TP")
+        train_n = len(train_r)
         train_wr = train_tp / train_n if train_n > 0 else 0
         train_ev = train_wr * TP_PIPS - (1 - train_wr) * SL_PIPS if train_n > 0 else 0
 
-        # Test stats
-        test_w = [r for r in test if r["window"] == w and r["trend_result"] in ("TP", "SL")]
-        test_tp = sum(1 for r in test_w if r["trend_result"] == "TP")
-        test_n = len(test_w)
+        test_tp = sum(1 for r in test_r if r["result"] == "TP")
+        test_n = len(test_r)
         test_wr = test_tp / test_n if test_n > 0 else 0
         test_ev = test_wr * TP_PIPS - (1 - test_wr) * SL_PIPS if test_n > 0 else 0
 
-        valid = "YES" if test_ev > 0 and test_n >= 20 else ("maybe" if test_ev > 0 else "NO")
+        valid = "YES" if test_ev > 0 and test_n >= 10 else ("maybe" if test_ev > 0 else "NO")
+
+        print(f"  {s['label']:<14} {s['wr']*100:>6.1f}% {s['ev']:>+7.1f}p {s['n']:>7} │ "
+              f"{train_wr*100:>7.1f}% {train_ev:>+8.1f}p │ "
+              f"{test_wr*100:>7.1f}% {test_ev:>+8.1f}p │ {valid:>8}")
+
         if valid == "YES":
-            validated_count += 1
+            validated.append((s, train_ev, test_ev, test_n))
 
-        print(f"  {s['label']:<14} {train_wr*100:>7.1f}% {train_ev:>+8.1f}p {train_n:>8} │ "
-              f"{test_wr*100:>7.1f}% {test_ev:>+8.1f}p {test_n:>8} │ {valid:>8}")
+    # Print config
+    print(f"\n{'='*110}")
+    print(f"  RECOMMENDED CONFIG ({len(validated)} validated windows)")
+    print(f"{'='*110}")
 
-    print(f"\n  Validated: {validated_count}/{min(len(profitable_windows), 15)} windows hold up in test period")
-
-    # Final validated config
-    print(f"\n  # VALIDATED window config (positive EV in BOTH train and test):")
-    print(f"  USE_TIME_WINDOWS = True")
-    print(f"  TRADE_WINDOWS = [")
-
-    for s in profitable_windows:
-        w = s["window"]
-        test_w = [r for r in test if r["window"] == w and r["trend_result"] in ("TP", "SL")]
-        test_tp = sum(1 for r in test_w if r["trend_result"] == "TP")
-        test_n = len(test_w)
-        test_wr = test_tp / test_n if test_n > 0 else 0
-        test_ev = test_wr * TP_PIPS - (1 - test_wr) * SL_PIPS if test_n > 0 else 0
-
-        if test_ev > 0 and test_n >= 20:
+    if validated:
+        print(f"\n  # Paste into bot's Config class:")
+        print(f"  USE_TIME_WINDOWS = True")
+        print(f"  TRADE_WINDOWS = [")
+        for s, train_ev, test_ev, test_n in validated:
             h, hh = s["window"]
             print(f"      ({h}, {hh}),  # {s['label']}: "
-                  f"train EV={s['trend_ev']:+.1f}p, test EV={test_ev:+.1f}p, "
-                  f"train N={s['trend_n']}, test N={test_n}")
+                  f"WR={s['wr']*100:.0f}%, EV={s['ev']:+.1f}p, N={s['n']}, "
+                  f"train={train_ev:+.1f}p, test={test_ev:+.1f}p")
+        print(f"  ]")
 
-    print(f"  ]")
+        # Per-pair detail for validated windows
+        print(f"\n  Per-pair breakdown for validated windows:")
+        for s, _, _, _ in validated:
+            print(f"\n    {s['label']}:")
+            for p, pd in sorted(s["pair_details"].items(), key=lambda x: -(x[1]["tp"]/(x[1]["tp"]+x[1]["sl"]) if x[1]["tp"]+x[1]["sl"]>0 else 0)):
+                t = pd["tp"] + pd["sl"]
+                if t > 0:
+                    wr = pd["tp"] / t
+                    ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
+                    bar = "+" * max(0, int(ev/3)) if ev > 0 else "-" * max(0, int(-ev/3))
+                    print(f"      {p:<10} WR={wr*100:>5.1f}%  EV={ev:>+6.1f}p  N={t:>4}  {bar}")
+    else:
+        print("\n  No windows validated in both train and test periods.")
+        print("  This means the profitable windows in-sample don't hold out-of-sample.")
+        print("  Consider: the bot's signal may not have a time-of-day edge.")
+
+
+def print_strategy_breakdown(results: List[dict]):
+    """Show how each strategy performs overall."""
+    print(f"\n{'='*110}")
+    print(f"  STRATEGY PERFORMANCE")
+    print(f"{'='*110}")
+
+    by_strat = defaultdict(lambda: {"tp": 0, "sl": 0})
+    for r in results:
+        if r["result"] == "TP":
+            by_strat[r["strategy"]]["tp"] += 1
+        else:
+            by_strat[r["strategy"]]["sl"] += 1
+
+    print(f"  {'Strategy':<25} {'WR%':>6} {'EV(p)':>7} {'Trades':>7} {'TP':>5} {'SL':>5}")
+    print(f"  {'-'*60}")
+    for strat, d in sorted(by_strat.items(), key=lambda x: -(x[1]["tp"]/(x[1]["tp"]+x[1]["sl"]) if x[1]["tp"]+x[1]["sl"]>0 else 0)):
+        total = d["tp"] + d["sl"]
+        wr = d["tp"] / total if total > 0 else 0
+        ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
+        print(f"  {strat:<25} {wr*100:>5.1f}% {ev:>+6.1f}p {total:>7} {d['tp']:>5} {d['sl']:>5}")
+
+    total_tp = sum(d["tp"] for d in by_strat.values())
+    total_sl = sum(d["sl"] for d in by_strat.values())
+    total = total_tp + total_sl
+    wr = total_tp / total if total > 0 else 0
+    ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
+    print(f"  {'-'*60}")
+    print(f"  {'TOTAL':<25} {wr*100:>5.1f}% {ev:>+6.1f}p {total:>7} {total_tp:>5} {total_sl:>5}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -687,104 +977,87 @@ def print_global_cross_validation(all_pair_results: Dict[str, List[dict]], profi
 # ─────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="30-Minute Window Optimizer for 40/60 Bot")
-    parser.add_argument("--data-dir", required=True, help="Directory containing parquet files")
-    parser.add_argument("--start", default=None, help="Start date (YYYY-MM-DD), default: use all data")
-    parser.add_argument("--end", default=None, help="End date (YYYY-MM-DD), default: use all data")
-    parser.add_argument("--pairs", nargs="+", default=None,
-                        help="Specific pairs to test (e.g., GBP_USD EUR_USD). Default: all available")
-    parser.add_argument("--min-samples", type=int, default=MIN_SAMPLE_SIZE,
-                        help=f"Min samples per window (default: {MIN_SAMPLE_SIZE})")
+    parser = argparse.ArgumentParser(description="Window Optimizer using bot's actual signal logic")
+    parser.add_argument("--data-dir", required=True, help="Directory with parquet files")
+    parser.add_argument("--start", default=None, help="Start date YYYY-MM-DD")
+    parser.add_argument("--end", default=None, help="End date YYYY-MM-DD")
+    parser.add_argument("--pairs", nargs="+", default=None, help="Pairs to test")
+    parser.add_argument("--min-samples", type=int, default=MIN_SAMPLE_SIZE)
     args = parser.parse_args()
 
     global MIN_SAMPLE_SIZE
     MIN_SAMPLE_SIZE = args.min_samples
 
-    print("=" * 120)
-    print("40/60 BOT — 30-MINUTE WINDOW OPTIMIZER")
-    print("Finding optimal trading windows using 5-second bid/ask data")
-    print(f"Strategy: TP +{TP_PIPS} pips / SL -{SL_PIPS} pips")
-    print(f"Breakeven win rate: {BREAKEVEN_WR*100:.0f}%")
-    print(f"Min sample size: {MIN_SAMPLE_SIZE}")
+    print("=" * 110)
+    print("40/60 BOT — WINDOW OPTIMIZER (using bot's actual signal logic)")
+    print("Strategies: momentum_pullback, trend_following, volatility_breakout")
+    print(f"Filters: Hurst>{HURST_THRESHOLD}, MTF bias>0.5, ATR {MIN_ATR_PIPS}-{MAX_ATR_PIPS}p, session>0.5")
+    print(f"TP/SL: +{TP_PIPS}/-{SL_PIPS} pips | Confidence threshold: {CONFIDENCE_THRESHOLD}")
+    print(f"Requires: talib, pandas, numpy, pyarrow")
     if args.start:
         print(f"Date range: {args.start} to {args.end or 'latest'}")
-    else:
-        print("Date range: ALL available data")
-    print("=" * 120)
+    print("=" * 110)
 
-    # Find available pairs
-    pairs_to_test = args.pairs if args.pairs else ALL_PAIRS
-    available_pairs = []
-    for pair in pairs_to_test:
-        path = find_parquet(args.data_dir, pair)
+    pairs = args.pairs or ALL_PAIRS
+    available = []
+    for p in pairs:
+        path = find_parquet(args.data_dir, p)
         if path:
-            available_pairs.append((pair, path))
+            available.append((p, path))
         else:
-            print(f"  WARNING: No parquet file found for {pair}, skipping")
+            print(f"  Skip {p}: no parquet found")
 
-    print(f"\nPairs to test: {', '.join(p for p, _ in available_pairs)}")
+    print(f"\nPairs: {', '.join(p for p, _ in available)}")
 
-    # Process each pair
-    all_pair_stats: Dict[str, List[dict]] = {}
-    all_pair_results: Dict[str, List[dict]] = {}
+    all_results = []
 
-    for pair, parquet_path in available_pairs:
+    for pair, path in available:
         print(f"\n{'─'*80}")
-        print(f"Processing {pair}...")
+        print(f"  {pair}")
         print(f"{'─'*80}")
 
+        print(f"    Loading 5s data...", end="", flush=True)
         t0 = time_mod.time()
+        df_5s = load_5s(path, args.start, args.end)
+        print(f" {len(df_5s):,} rows in {time_mod.time()-t0:.1f}s")
 
-        # Load data
-        print(f"  Loading 5s data...", end="", flush=True)
-        data = load_pair_data(parquet_path, args.start, args.end)
-        print(f" {data['n']:,} rows in {time_mod.time()-t0:.1f}s")
+        results = process_pair(pair, df_5s)
+        all_results.extend(results)
 
-        # Find entry points
-        print(f"  Finding window entry points...", end="", flush=True)
-        entries = find_window_entries(data)
-        print(f" {len(entries):,} entries across {len(set(e['date'] for e in entries)):,} trading days")
+        # Quick per-pair summary
+        if results:
+            tp = sum(1 for r in results if r["result"] == "TP")
+            sl = sum(1 for r in results if r["result"] == "SL")
+            total = tp + sl
+            wr = tp / total if total > 0 else 0
+            ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
+            print(f"    {pair} summary: {total} trades, WR={wr*100:.1f}%, EV={ev:+.1f}p")
 
-        # Simulate
-        print(f"  Simulating trades...", end="", flush=True)
-        t1 = time_mod.time()
-        pip = pip_size(pair)
-        results = simulate_entries(data, entries, pip)
-        elapsed = time_mod.time() - t1
-        print(f" done in {elapsed:.1f}s ({len(results)/max(elapsed,0.001):.0f} trades/sec)")
+        del df_5s  # Free memory
 
-        # Quick summary
-        trend_tp = sum(1 for r in results if r["trend_result"] == "TP")
-        trend_sl = sum(1 for r in results if r["trend_result"] == "SL")
-        trend_total = trend_tp + trend_sl
-        if trend_total > 0:
-            overall_wr = trend_tp / trend_total
-            overall_ev = overall_wr * TP_PIPS - (1 - overall_wr) * SL_PIPS
-            print(f"  Overall trend-following: WR={overall_wr*100:.1f}%, EV={overall_ev:+.1f}p, "
-                  f"N={trend_total}")
+    if not all_results:
+        print("\nNo trades generated. The bot's signal logic produced no signals in this data range.")
+        return
 
-        # Aggregate
-        agg = aggregate_results(results, pair)
-        stats = compute_window_stats(agg)
-        all_pair_stats[pair] = stats
-        all_pair_results[pair] = results
+    # Overall stats
+    print_strategy_breakdown(all_results)
 
-        # Print per-pair ranking
-        print_pair_report(pair, stats)
-
-        # Free memory
-        del data
+    # Per-pair rankings
+    for pair, _ in available:
+        pair_results = [r for r in all_results if r["pair"] == pair]
+        if pair_results:
+            print_window_ranking(pair_results, f"{pair} — Window Rankings")
 
     # Global ranking
-    profitable = print_global_ranking(all_pair_stats, all_pair_results)
+    stats = print_window_ranking(all_results, "GLOBAL WINDOW RANKING (all pairs combined)")
 
-    # Cross-validation
-    if profitable:
-        print_global_cross_validation(all_pair_results, profitable)
+    # Recommended config with cross-validation
+    if stats:
+        print_recommended_config(stats, all_results)
 
-    print(f"\n{'='*120}")
+    print(f"\n{'='*110}")
     print("DONE")
-    print(f"{'='*120}")
+    print(f"{'='*110}")
 
 
 if __name__ == "__main__":
