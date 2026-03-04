@@ -36,8 +36,11 @@ Usage:
 """
 
 import argparse
+import gc
 import glob
+import json
 import os
+import pickle
 import sys
 import time as time_mod
 from collections import defaultdict
@@ -98,6 +101,38 @@ ALL_PAIRS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD",
 TF_WEIGHTS = {'M1': 0.05, 'M5': 0.20, 'M15': 0.30, 'H1': 0.25, 'H4': 0.20}
 
 
+CHECKPOINT_DIR = ".optimizer_checkpoints"
+
+
+def save_checkpoint(pair: str, results: List[dict], pair_info: dict, run_id: str):
+    """Save pair results to disk so we can resume after a crash."""
+    os.makedirs(os.path.join(CHECKPOINT_DIR, run_id), exist_ok=True)
+    path = os.path.join(CHECKPOINT_DIR, run_id, f"{pair}.pkl")
+    with open(path, "wb") as f:
+        pickle.dump({"results": results, "pair_info": pair_info}, f)
+    print(f"    Checkpoint saved: {path}")
+
+
+def load_checkpoint(pair: str, run_id: str) -> Optional[Tuple[List[dict], dict]]:
+    """Load pair results from a previous checkpoint."""
+    path = os.path.join(CHECKPOINT_DIR, run_id, f"{pair}.pkl")
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        return data["results"], data["pair_info"]
+    return None
+
+
+def get_run_id(args) -> str:
+    """Generate a deterministic run ID from the args so checkpoints match."""
+    key_parts = [
+        args.data_dir,
+        str(args.start), str(args.end),
+        str(args.slippage), str(args.min_samples),
+    ]
+    return "run_" + str(abs(hash("|".join(key_parts))) % 10**8)
+
+
 def pip_val(pair: str) -> float:
     return 0.01 if "JPY" in pair else 0.0001
 
@@ -119,16 +154,32 @@ def find_parquet(data_dir: str, pair: str) -> Optional[str]:
 
 
 def load_5s(path: str, start: str = None, end: str = None) -> pd.DataFrame:
-    """Load 5s parquet with all columns needed."""
+    """Load 5s parquet with all columns needed. Memory-efficient: avoids unnecessary copies."""
     filters = []
     if start:
         filters.append(("time", ">=", pd.Timestamp(start, tz="UTC")))
     if end:
         filters.append(("time", "<=", pd.Timestamp(end, tz="UTC")))
 
-    df = pq.read_table(path, filters=filters or None).to_pandas()
-    df = df.sort_values("time").reset_index(drop=True)
-    df = df.set_index("time")
+    # Only load columns we actually need (bid/ask OHLC + volume + time)
+    needed_cols = None
+    try:
+        schema = pq.read_schema(path)
+        all_cols = [f.name for f in schema]
+        # Keep: time, bid/ask OHLC, open/high/low/close, volume
+        keep = {"time", "open", "high", "low", "close", "volume",
+                "bid_open", "bid_high", "bid_low", "bid_close",
+                "ask_open", "ask_high", "ask_low", "ask_close"}
+        needed_cols = [c for c in all_cols if c in keep]
+        if not needed_cols or "time" not in needed_cols:
+            needed_cols = None  # Fall back to loading all if time column missing
+    except Exception:
+        pass  # Fall back to loading all columns
+
+    df = pq.read_table(path, columns=needed_cols, filters=filters or None).to_pandas()
+    # Sort in-place to avoid copy, then set index directly
+    df.sort_values("time", inplace=True)
+    df.set_index("time", inplace=True)
     return df
 
 
@@ -837,6 +888,11 @@ def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3) -> 
         "unresolved": trades_unresolved,
     }
 
+    # Free large intermediate DataFrames before returning
+    del df_m1_full, df_m5_full, df_m15_full, df_h1_full, df_h4_full
+    del bid_high_5s, bid_low_5s, ask_high_5s, ask_low_5s, ask_close_5s, bid_close_5s
+    gc.collect()
+
     return results, pair_info
 
 
@@ -1355,6 +1411,8 @@ def main():
                         help=f"Min trades per WF test fold (default: {MIN_FOLD_TRADES})")
     parser.add_argument("--min-pass-rate", type=float, default=MIN_PASS_RATE,
                         help=f"Min fraction of folds that must pass (default: {MIN_PASS_RATE})")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from checkpoint — skip pairs that already completed")
     args = parser.parse_args()
 
     MIN_SAMPLE_SIZE = args.min_samples
@@ -1381,6 +1439,7 @@ def main():
     print(f"  Min samples: {MIN_SAMPLE_SIZE} total, {MIN_FOLD_TRADES} per test fold")
     if args.start:
         print(f"  Date range: {args.start} to {args.end or 'latest'}")
+    print(f"  Checkpoints: {CHECKPOINT_DIR}/ (use --resume to continue after crash)")
     print("=" * 120)
 
     pairs = args.pairs or ALL_PAIRS
@@ -1394,38 +1453,82 @@ def main():
 
     print(f"\nPairs: {', '.join(p for p, _ in available)}")
 
+    run_id = get_run_id(args)
+    if args.resume:
+        print(f"\n  RESUME MODE: looking for checkpoints in {CHECKPOINT_DIR}/{run_id}/")
+
     all_results = []
     pair_results_map = {}
     pair_info_map = {}
+    failed_pairs = []
 
-    for pair, path in available:
+    for pair_idx, (pair, path) in enumerate(available):
         print(f"\n{'─'*80}")
-        print(f"  {pair}")
+        print(f"  {pair}  ({pair_idx+1}/{len(available)})")
         print(f"{'─'*80}")
 
-        print(f"    Loading 5s data...", end="", flush=True)
-        t0 = time_mod.time()
-        df_5s = load_5s(path, args.start, args.end)
-        print(f" {len(df_5s):,} rows in {time_mod.time()-t0:.1f}s")
+        # Check for existing checkpoint
+        if args.resume:
+            cached = load_checkpoint(pair, run_id)
+            if cached is not None:
+                results, pair_info = cached
+                all_results.extend(results)
+                pair_results_map[pair] = results
+                pair_info_map[pair] = pair_info
+                tp = sum(1 for r in results if r["result"] == "TP")
+                total = len(results)
+                wr = tp / total if total > 0 else 0
+                ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
+                print(f"    RESUMED from checkpoint: {total} trades, WR={wr*100:.1f}%, EV={ev:+.1f}p")
+                continue
 
-        results, pair_info = process_pair(pair, df_5s, slippage_pips=args.slippage)
-        all_results.extend(results)
-        pair_results_map[pair] = results
-        pair_info_map[pair] = pair_info
+        try:
+            print(f"    Loading 5s data...", end="", flush=True)
+            t0 = time_mod.time()
+            df_5s = load_5s(path, args.start, args.end)
+            print(f" {len(df_5s):,} rows in {time_mod.time()-t0:.1f}s")
 
-        # Quick per-pair summary
-        if results:
-            tp = sum(1 for r in results if r["result"] == "TP")
-            sl = sum(1 for r in results if r["result"] == "SL")
-            total = tp + sl
-            wr = tp / total if total > 0 else 0
-            ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
-            print(f"    {pair} summary: {total} trades, WR={wr*100:.1f}%, EV={ev:+.1f}p")
+            results, pair_info = process_pair(pair, df_5s, slippage_pips=args.slippage)
+            all_results.extend(results)
+            pair_results_map[pair] = results
+            pair_info_map[pair] = pair_info
 
-        del df_5s  # Free memory
+            # Quick per-pair summary
+            if results:
+                tp = sum(1 for r in results if r["result"] == "TP")
+                sl = sum(1 for r in results if r["result"] == "SL")
+                total = tp + sl
+                wr = tp / total if total > 0 else 0
+                ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
+                print(f"    {pair} summary: {total} trades, WR={wr*100:.1f}%, EV={ev:+.1f}p")
+
+            # Save checkpoint immediately
+            save_checkpoint(pair, results, pair_info, run_id)
+
+        except Exception as e:
+            print(f"\n    ERROR processing {pair}: {e}")
+            print(f"    Skipping {pair} — other pairs will continue.")
+            print(f"    Re-run with --resume to retry this pair without redoing the others.")
+            failed_pairs.append((pair, str(e)))
+
+        finally:
+            # Aggressive memory cleanup
+            try:
+                del df_5s
+            except NameError:
+                pass
+            gc.collect()
+
+    if failed_pairs:
+        print(f"\n{'='*120}")
+        print(f"  WARNING: {len(failed_pairs)} pair(s) FAILED — re-run with --resume to retry")
+        print(f"{'='*120}")
+        for pair, err in failed_pairs:
+            print(f"  {pair}: {err}")
+        print(f"  Checkpoint dir: {CHECKPOINT_DIR}/{run_id}/")
 
     if not all_results:
-        print("\nNo trades generated. The bot's signal logic produced no signals in this data range.")
+        print("\nNo trades generated. Check errors above or signal logic.")
         return
 
     # ─── Processing summary ───
