@@ -573,9 +573,19 @@ def volatility_breakout_signal(df_m5: pd.DataFrame, market: dict, pair: str) -> 
 # Signal orchestrator (exact replica of bot's generate_signals)
 # ─────────────────────────────────────────────────────────
 
-def generate_signal(df_m5: pd.DataFrame, market: dict, pair: str) -> Optional[dict]:
+STRATEGY_MAP = {
+    "momentum_pullback": momentum_pullback_signal,
+    "trend_following": trend_following_signal,
+    "volatility_breakout": volatility_breakout_signal,
+}
+
+ALL_STRATEGIES = list(STRATEGY_MAP.keys())
+
+
+def generate_signal(df_m5: pd.DataFrame, market: dict, pair: str,
+                    strategies: List[str] = None) -> Optional[dict]:
     """
-    Run all three active strategies, pick the best signal above confidence threshold.
+    Run selected strategies (or all three), pick the best signal above confidence threshold.
     Exact replica of the bot's generate_signals() minus API/logging/dedup.
     """
     # Pre-checks (from generate_signals)
@@ -586,8 +596,12 @@ def generate_signal(df_m5: pd.DataFrame, market: dict, pair: str) -> Optional[di
     if market["hurst"] < HURST_THRESHOLD:
         return None
 
+    if strategies is None:
+        strategies = ALL_STRATEGIES
+
     signals = []
-    for strategy_fn in [momentum_pullback_signal, trend_following_signal, volatility_breakout_signal]:
+    for strat_name in strategies:
+        strategy_fn = STRATEGY_MAP[strat_name]
         sig = strategy_fn(df_m5, market, pair)
         if sig and sig["confidence"] >= CONFIDENCE_THRESHOLD:
             # R/R for 40/60 is always 40/60 = 0.667, which passes MIN_RISK_REWARD of 0.5
@@ -660,11 +674,12 @@ def simulate_trade_5s(direction: str, entry_idx: int, entry_price: float,
 # Main processing loop (V2: concurrent tracking + slippage)
 # ─────────────────────────────────────────────────────────
 
-def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3) -> Tuple[List[dict], dict]:
+def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3,
+                 max_concurrent: int = 1, strategies: List[str] = None) -> Tuple[List[dict], dict]:
     """
     Process one pair: resample, compute indicators on all timeframes,
     evaluate signals at each M5 bar, simulate trades with:
-      - 1 concurrent trade max per pair (matching bot)
+      - max_concurrent trades per pair (default 1, matching bot)
       - Adverse slippage on entry
       - No forward candle limit
     Returns (results_list, stats_dict).
@@ -722,7 +737,8 @@ def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3) -> 
     # ─── Evaluate signal at each M5 bar ───
     m5_times = df_m5_full.index
     n_m5 = len(m5_times)
-    print(f"    Evaluating {n_m5:,} M5 bars (1 trade/pair, slippage={slippage_pips}p)...",
+    strat_label = ",".join(strategies) if strategies else "all"
+    print(f"    Evaluating {n_m5:,} M5 bars ({max_concurrent} trade/pair, strats={strat_label}, slippage={slippage_pips}p)...",
           end="", flush=True)
     t0 = time_mod.time()
 
@@ -732,8 +748,8 @@ def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3) -> 
     trades_unresolved = 0
     last_print = t0
 
-    # Track concurrent trades: 1 max per pair (matching bot's behavior)
-    open_trade_exit_5s_idx = -1
+    # Track concurrent trades: max_concurrent per pair
+    open_trade_exit_indices = []  # list of exit 5s indices for open trades
 
     for i in range(max(50, MACD_SLOW + MACD_SIGNAL), n_m5):
         m5_time = m5_times[i]
@@ -745,7 +761,7 @@ def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3) -> 
             pct = i / n_m5 * 100
             rate = i / max(elapsed, 0.001)
             eta = (n_m5 - i) / max(rate, 1)
-            print(f"\r    Evaluating {n_m5:,} M5 bars (1 trade/pair, slippage={slippage_pips}p)... "
+            print(f"\r    Evaluating {n_m5:,} M5 bars ({max_concurrent} trade/pair, slippage={slippage_pips}p)... "
                   f"{pct:.0f}% ({signals_found} sig, {trades_simulated} trades, "
                   f"{trades_skipped_concurrent} concurrent-skip, ETA {eta:.0f}s)",
                   end="", flush=True)
@@ -817,7 +833,7 @@ def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3) -> 
         }
 
         # ─── Generate signal ───
-        sig = generate_signal(df_m5, market, pair)
+        sig = generate_signal(df_m5, market, pair, strategies=strategies)
         if sig is None:
             continue
 
@@ -828,8 +844,10 @@ def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3) -> 
         if entry_5s_idx >= n_5s - 2:
             continue
 
-        # ─── Check concurrent trade (1 max per pair) ───
-        if entry_5s_idx <= open_trade_exit_5s_idx:
+        # ─── Check concurrent trade (max_concurrent per pair) ───
+        # Remove closed trades (exit idx < current entry idx)
+        open_trade_exit_indices = [idx for idx in open_trade_exit_indices if idx >= entry_5s_idx]
+        if len(open_trade_exit_indices) >= max_concurrent:
             trades_skipped_concurrent += 1
             continue
 
@@ -847,13 +865,13 @@ def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3) -> 
         )
 
         if result is None:
-            # Trade unresolved at end of data — pair locked for remaining data
-            open_trade_exit_5s_idx = n_5s
+            # Trade unresolved at end of data — slot locked for remaining data
+            open_trade_exit_indices.append(n_5s)
             trades_unresolved += 1
             continue
 
         outcome, exit_5s_idx = result
-        open_trade_exit_5s_idx = exit_5s_idx
+        open_trade_exit_indices.append(exit_5s_idx)
         trades_simulated += 1
 
         # Record result with window info
@@ -1304,6 +1322,137 @@ def print_walk_forward_detail(validated: List[dict], pair: str,
               f"worst month={dd['worst_month']} ({dd['worst_month_pnl']:+.0f}p)")
 
 
+def print_pnl_summary(results: List[dict], lot_size: float = 0.1):
+    """
+    Print detailed P&L breakdown: total pips, USD estimates, monthly/yearly,
+    per-pair, drawdown, and trade frequency.
+
+    USD per pip approximation:
+      - Standard lot (1.0) = $10/pip for most pairs, $~6.7/pip for JPY crosses vs USD
+      - Mini lot (0.1) = $1/pip
+      - We use $10 * lot_size per pip as a reasonable approximation.
+    """
+    if not results:
+        return
+
+    usd_per_pip = 10.0 * lot_size  # Approximate: $10/pip per standard lot
+
+    print(f"\n{'='*120}")
+    print(f"  P&L SUMMARY (lot size: {lot_size}, ~${usd_per_pip:.2f}/pip)")
+    print(f"{'='*120}")
+
+    # Overall stats
+    total_tp = sum(1 for r in results if r["result"] == "TP")
+    total_sl = sum(1 for r in results if r["result"] == "SL")
+    total_trades = total_tp + total_sl
+    wr = total_tp / total_trades if total_trades > 0 else 0
+    total_pips = total_tp * TP_PIPS - total_sl * SL_PIPS
+    total_usd = total_pips * usd_per_pip
+    ev_per_trade = total_pips / total_trades if total_trades > 0 else 0
+    pf = (total_tp * TP_PIPS) / (total_sl * SL_PIPS) if total_sl > 0 else float('inf')
+
+    print(f"\n  Overall:")
+    print(f"    Trades:          {total_trades:,} ({total_tp:,} TP / {total_sl:,} SL)")
+    print(f"    Win Rate:        {wr*100:.1f}%")
+    print(f"    Total Pips:      {total_pips:+,.0f}")
+    print(f"    Total USD:       ${total_usd:+,.2f}")
+    print(f"    EV/Trade:        {ev_per_trade:+.1f} pips (${ev_per_trade * usd_per_pip:+.2f})")
+    print(f"    Profit Factor:   {pf:.2f}")
+
+    # Date range and frequency
+    dates = sorted(set(r['date'] for r in results))
+    if len(dates) >= 2:
+        first_date = dates[0]
+        last_date = dates[-1]
+        total_days = (last_date - first_date).days
+        total_months = total_days / 30.44
+        total_years = total_days / 365.25
+
+        trades_per_day = total_trades / total_days if total_days > 0 else 0
+        trades_per_month = total_trades / total_months if total_months > 0 else 0
+        trades_per_year = total_trades / total_years if total_years > 0 else 0
+
+        pips_per_month = total_pips / total_months if total_months > 0 else 0
+        pips_per_year = total_pips / total_years if total_years > 0 else 0
+        usd_per_month = pips_per_month * usd_per_pip
+        usd_per_year = pips_per_year * usd_per_pip
+
+        print(f"\n  Time Period:")
+        print(f"    Data range:      {first_date} to {last_date} ({total_days:,} days / {total_years:.1f} years)")
+        print(f"    Trades/day:      {trades_per_day:.1f}")
+        print(f"    Trades/month:    {trades_per_month:.0f}")
+        print(f"    Trades/year:     {trades_per_year:.0f}")
+
+        print(f"\n  Projected Returns:")
+        print(f"    Per Month:       {pips_per_month:+,.0f} pips  /  ${usd_per_month:+,.2f}")
+        print(f"    Per Year:        {pips_per_year:+,.0f} pips  /  ${usd_per_year:+,.2f}")
+
+    # Drawdown on full trade sequence
+    dd = compute_drawdown(results)
+    print(f"\n  Risk Metrics:")
+    print(f"    Max Drawdown:    {dd['max_drawdown_pips']:.0f} pips (${dd['max_drawdown_pips'] * usd_per_pip:,.2f})")
+    print(f"    Max Consec Loss: {dd['max_consecutive_losses']}")
+    print(f"    Max Consec Win:  {dd['max_consecutive_wins']}")
+    print(f"    Worst Month:     {dd['worst_month']} ({dd['worst_month_pnl']:+.0f} pips / ${dd['worst_month_pnl'] * usd_per_pip:+,.2f})")
+    print(f"    Best Month:      {dd['best_month_pnl']:+.0f} pips (${dd['best_month_pnl'] * usd_per_pip:+,.2f})")
+
+    # Per-pair breakdown
+    by_pair = defaultdict(lambda: {"tp": 0, "sl": 0})
+    for r in results:
+        if r["result"] == "TP":
+            by_pair[r["pair"]]["tp"] += 1
+        else:
+            by_pair[r["pair"]]["sl"] += 1
+
+    print(f"\n  Per-Pair P&L:")
+    print(f"  {'Pair':<10} {'Trades':>7} {'WR%':>6} {'Pips':>8} {'USD':>10} {'EV/Trade':>10} {'PF':>5}")
+    print(f"  {'-'*60}")
+
+    for pair in sorted(by_pair.keys()):
+        d = by_pair[pair]
+        n = d["tp"] + d["sl"]
+        w = d["tp"] / n if n > 0 else 0
+        pips = d["tp"] * TP_PIPS - d["sl"] * SL_PIPS
+        usd = pips * usd_per_pip
+        ev = pips / n if n > 0 else 0
+        pair_pf = (d["tp"] * TP_PIPS) / (d["sl"] * SL_PIPS) if d["sl"] > 0 else float('inf')
+        print(f"  {pair:<10} {n:>7} {w*100:>5.1f}% {pips:>+7.0f}p ${usd:>+9,.2f} {ev:>+9.1f}p {pair_pf:>5.2f}")
+
+    # Monthly P&L table
+    monthly_pnl = defaultdict(lambda: {"tp": 0, "sl": 0})
+    for r in results:
+        key = f"{r['date'].year}-{r['date'].month:02d}"
+        if r["result"] == "TP":
+            monthly_pnl[key]["tp"] += 1
+        else:
+            monthly_pnl[key]["sl"] += 1
+
+    months_sorted = sorted(monthly_pnl.keys())
+    if len(months_sorted) > 0:
+        print(f"\n  Monthly P&L (last 24 months shown if >24):")
+        print(f"  {'Month':<10} {'Trades':>7} {'WR%':>6} {'Pips':>8} {'USD':>10}")
+        print(f"  {'-'*45}")
+
+        show_months = months_sorted[-24:] if len(months_sorted) > 24 else months_sorted
+        if len(months_sorted) > 24:
+            print(f"  ... ({len(months_sorted) - 24} earlier months omitted)")
+
+        profitable_months = 0
+        for m in show_months:
+            d = monthly_pnl[m]
+            n = d["tp"] + d["sl"]
+            pips = d["tp"] * TP_PIPS - d["sl"] * SL_PIPS
+            w = d["tp"] / n if n > 0 else 0
+            usd = pips * usd_per_pip
+            if pips > 0:
+                profitable_months += 1
+            print(f"  {m:<10} {n:>7} {w*100:>5.1f}% {pips:>+7.0f}p ${usd:>+9,.2f}")
+
+        total_shown = len(show_months)
+        print(f"\n  Profitable months: {profitable_months}/{total_shown} "
+              f"({profitable_months/total_shown*100:.0f}%)" if total_shown > 0 else "")
+
+
 def print_recommended_config(all_validated: Dict[str, List[dict]]):
     """Print the final recommended PAIR_WINDOWS config."""
     print(f"\n{'='*120}")
@@ -1412,6 +1561,13 @@ def main():
                         help=f"Min fraction of folds that must pass (default: {MIN_PASS_RATE})")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from checkpoint — skip pairs that already completed")
+    parser.add_argument("--strategy", nargs="+", default=None,
+                        choices=["volatility_breakout", "trend_following", "momentum_pullback"],
+                        help="Only test specific strategies (default: all three)")
+    parser.add_argument("--max-concurrent", type=int, default=1,
+                        help="Max concurrent trades per pair (default: 1, bot default)")
+    parser.add_argument("--lot-size", type=float, default=0.1,
+                        help="Lot size per trade for USD P&L estimates (default: 0.1 = mini lot)")
     args = parser.parse_args()
 
     # Use args values directly — no global mutation
@@ -1421,16 +1577,25 @@ def main():
     min_fold_trades = args.min_fold_trades
     min_pass_rate = args.min_pass_rate
     slippage = args.slippage
+    strategies = args.strategy  # None means all
+    max_concurrent = args.max_concurrent
+    lot_size = args.lot_size
+
+    strat_names = strategies if strategies else ALL_STRATEGIES
 
     print("=" * 120)
     print("40/60 BOT — WINDOW OPTIMIZER V2 (per-pair per-window, walk-forward validated)")
     print("=" * 120)
-    print(f"  Strategies: momentum_pullback, trend_following, volatility_breakout")
+    if strategies:
+        print(f"  Strategies: {', '.join(strat_names)} (FILTERED)")
+    else:
+        print(f"  Strategies: {', '.join(strat_names)}")
     print(f"  Filters: Hurst>{HURST_THRESHOLD}, MTF bias>0.5, ATR {MIN_ATR_PIPS}-{MAX_ATR_PIPS}p, session>0.5")
     print(f"  TP/SL: +{TP_PIPS}/-{SL_PIPS} pips | Confidence threshold: {CONFIDENCE_THRESHOLD}")
     print(f"  Breakeven WR: {BREAKEVEN_WR*100:.0f}%")
-    print(f"  Concurrent trades: 1 per pair (matching bot)")
+    print(f"  Concurrent trades: {max_concurrent} per pair")
     print(f"  Adverse slippage: {args.slippage} pips on entry")
+    print(f"  Lot size: {lot_size} (for USD P&L estimates)")
     print(f"  Trade forward limit: NONE (trades resolve fully)")
     print(f"  Walk-forward: {wf_train}m initial train, {wf_test}m test periods, "
           f"expanding window")
@@ -1488,7 +1653,9 @@ def main():
             df_5s = load_5s(path, args.start, args.end)
             print(f" {len(df_5s):,} rows in {time_mod.time()-t0:.1f}s")
 
-            results, pair_info = process_pair(pair, df_5s, slippage_pips=args.slippage)
+            results, pair_info = process_pair(pair, df_5s, slippage_pips=args.slippage,
+                                               max_concurrent=max_concurrent,
+                                               strategies=strategies)
             all_results.extend(results)
             pair_results_map[pair] = results
             pair_info_map[pair] = pair_info
@@ -1575,6 +1742,9 @@ def main():
 
     # ─── Recommended config ───
     print_recommended_config(all_validated)
+
+    # ─── P&L Summary ───
+    print_pnl_summary(all_results, lot_size)
 
     print(f"\n{'='*120}")
     print("DONE")
