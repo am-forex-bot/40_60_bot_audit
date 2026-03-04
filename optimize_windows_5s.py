@@ -1121,7 +1121,7 @@ def print_strategy_breakdown(results: List[dict]):
     print(f"  {'TOTAL':<25} {wr*100:>5.1f}% {ev:>+6.1f}p {total:>7} {total_tp:>6} {total_sl:>6} {pf:>5.2f}")
 
 
-def print_pair_window_ranking(results: List[dict], pair: str):
+def print_pair_window_ranking(results: List[dict], pair: str, min_n: int = MIN_SAMPLE_SIZE):
     """Print window ranking for a single pair."""
     if not results:
         return
@@ -1174,7 +1174,7 @@ def print_pair_window_ranking(results: List[dict], pair: str):
     print(f"  {'-'*110}")
 
     for s in stats:
-        if s["ev"] > 0 and s["n"] >= MIN_SAMPLE_SIZE:
+        if s["ev"] > 0 and s["n"] >= min_n:
             status = "PROFITABLE"
         elif s["ev"] > 0 and s["n"] >= 30:
             status = "positive"
@@ -1264,13 +1264,15 @@ def validate_pair_windows(pair_results: List[dict], pair: str,
     return validated
 
 
-def print_walk_forward_detail(validated: List[dict], pair: str):
+def print_walk_forward_detail(validated: List[dict], pair: str,
+                              wf_test: int = WF_TEST_MONTHS,
+                              min_pass_rate: float = MIN_PASS_RATE):
     """Print detailed walk-forward results for one pair."""
     print(f"\n{'='*120}")
     print(f"  {pair} — WALK-FORWARD VALIDATION")
-    print(f"  Expanding window: train from start, {WF_TEST_MONTHS}-month non-overlapping test periods")
+    print(f"  Expanding window: train from start, {wf_test}-month non-overlapping test periods")
     print(f"  Pass criteria: BOTH train AND test WR > {BREAKEVEN_WR*100:.0f}% per fold, "
-          f">={MIN_PASS_RATE*100:.0f}% of folds pass, overall test WR > {BREAKEVEN_WR*100:.0f}%")
+          f">={min_pass_rate*100:.0f}% of folds pass, overall test WR > {BREAKEVEN_WR*100:.0f}%")
     print(f"{'='*120}")
 
     if not validated:
@@ -1390,9 +1392,6 @@ def print_recommended_config(all_validated: Dict[str, List[dict]]):
 # ─────────────────────────────────────────────────────────
 
 def main():
-    global MIN_SAMPLE_SIZE, WF_TRAIN_MONTHS, WF_TEST_MONTHS, MIN_FOLD_TRADES
-    global MIN_FOLDS_REQUIRED, MIN_PASS_RATE, SLIPPAGE_DEFAULT
-
     parser = argparse.ArgumentParser(
         description="Window Optimizer V2 — per-pair per-window, walk-forward validated")
     parser.add_argument("--data-dir", required=True, help="Directory with parquet files")
@@ -1415,12 +1414,13 @@ def main():
                         help="Resume from checkpoint — skip pairs that already completed")
     args = parser.parse_args()
 
-    MIN_SAMPLE_SIZE = args.min_samples
-    WF_TRAIN_MONTHS = args.wf_train
-    WF_TEST_MONTHS = args.wf_test
-    MIN_FOLD_TRADES = args.min_fold_trades
-    MIN_PASS_RATE = args.min_pass_rate
-    SLIPPAGE_DEFAULT = args.slippage
+    # Use args values directly — no global mutation
+    min_sample_size = args.min_samples
+    wf_train = args.wf_train
+    wf_test = args.wf_test
+    min_fold_trades = args.min_fold_trades
+    min_pass_rate = args.min_pass_rate
+    slippage = args.slippage
 
     print("=" * 120)
     print("40/60 BOT — WINDOW OPTIMIZER V2 (per-pair per-window, walk-forward validated)")
@@ -1432,11 +1432,11 @@ def main():
     print(f"  Concurrent trades: 1 per pair (matching bot)")
     print(f"  Adverse slippage: {args.slippage} pips on entry")
     print(f"  Trade forward limit: NONE (trades resolve fully)")
-    print(f"  Walk-forward: {WF_TRAIN_MONTHS}m initial train, {WF_TEST_MONTHS}m test periods, "
+    print(f"  Walk-forward: {wf_train}m initial train, {wf_test}m test periods, "
           f"expanding window")
     print(f"  Validation: both train+test WR>{BREAKEVEN_WR*100:.0f}% per fold, "
-          f">={MIN_PASS_RATE*100:.0f}% folds pass")
-    print(f"  Min samples: {MIN_SAMPLE_SIZE} total, {MIN_FOLD_TRADES} per test fold")
+          f">={min_pass_rate*100:.0f}% folds pass")
+    print(f"  Min samples: {min_sample_size} total, {min_fold_trades} per test fold")
     if args.start:
         print(f"  Date range: {args.start} to {args.end or 'latest'}")
     print(f"  Checkpoints: {CHECKPOINT_DIR}/ (use --resume to continue after crash)")
@@ -1549,7 +1549,7 @@ def main():
     for pair, _ in available:
         results = pair_results_map.get(pair, [])
         if results:
-            print_pair_window_ranking(results, pair)
+            print_pair_window_ranking(results, pair, min_n=min_sample_size)
 
     # ─── Walk-forward validation per pair ───
     all_validated = {}
@@ -1562,16 +1562,16 @@ def main():
 
         validated = validate_pair_windows(
             results, pair,
-            train_months=WF_TRAIN_MONTHS,
-            test_months=WF_TEST_MONTHS,
-            min_fold_trades=MIN_FOLD_TRADES,
-            min_pass_rate=MIN_PASS_RATE,
-            min_total_n=MIN_SAMPLE_SIZE,
+            train_months=wf_train,
+            test_months=wf_test,
+            min_fold_trades=min_fold_trades,
+            min_pass_rate=min_pass_rate,
+            min_total_n=min_sample_size,
         )
         all_validated[pair] = validated
 
         # Print walk-forward detail
-        print_walk_forward_detail(validated, pair)
+        print_walk_forward_detail(validated, pair, wf_test=wf_test, min_pass_rate=min_pass_rate)
 
     # ─── Recommended config ───
     print_recommended_config(all_validated)
