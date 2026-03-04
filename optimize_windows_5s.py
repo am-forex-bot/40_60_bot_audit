@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
-30-Minute Window Optimizer for the 40/60 Bot
+30-Minute Window Optimizer V2 for the 40/60 Bot
+
+Changes from V1:
+  - No forward candle limit — trades resolve fully against all available data
+  - Concurrent trade limit: 1 per pair (matching bot's actual behavior)
+  - Per-pair per-window analysis (not just global windows)
+  - Walk-forward validation (expanding window, 3-month non-overlapping test periods)
+  - Drawdown & max consecutive loss analysis
+  - Net slippage modeling (adverse slippage on entry)
+  - Stricter validation: BOTH train AND test must beat breakeven WR per fold
 
 Uses the bot's ACTUAL signal generation logic (momentum pullback, trend following,
 volatility breakout) against 5-second parquet data resampled to M1/M5/M15/H1/H4.
@@ -8,10 +17,10 @@ volatility breakout) against 5-second parquet data resampled to M1/M5/M15/H1/H4.
 For each pair:
   - Resamples 5s data to all timeframes the bot uses
   - Evaluates the bot's signal logic at every M5 bar
-  - When a signal fires, simulates the trade using 5s bid/ask data
+  - When a signal fires, checks no concurrent trade is open on that pair
+  - Simulates the trade using 5s bid/ask data (with slippage)
   - Records outcome grouped by 30-minute window
-
-Cross-validates with train/test split to avoid curve-fitting.
+  - Walk-forward validates each pair-window combination
 
 Requirements:
     pip install pandas numpy pyarrow ta-lib
@@ -19,8 +28,8 @@ Requirements:
 Usage:
     python3 optimize_windows_5s.py --data-dir /path/to/parquet/files
 
-    # Recent data only
-    python3 optimize_windows_5s.py --data-dir /path/to/parquets --start 2024-01-01
+    # With custom slippage
+    python3 optimize_windows_5s.py --data-dir /path/to/parquets --slippage 0.5
 
     # Specific pairs
     python3 optimize_windows_5s.py --data-dir /path/to/parquets --pairs GBP_USD EUR_USD
@@ -64,11 +73,20 @@ HURST_MIN_WINDOW = 10
 HURST_MAX_WINDOW = 50
 HURST_NUM_WINDOWS = 15
 
-# Max 5s candles to walk forward for TP/SL resolution
-MAX_FORWARD_5S = 50_000  # ~69 hours
+# No forward candle limit — trades resolve against all remaining data
 
-# Min samples for a window to be meaningful
-MIN_SAMPLE_SIZE = 30
+# Min samples for a pair-window to be considered
+MIN_SAMPLE_SIZE = 100
+
+# Walk-forward validation defaults
+WF_TRAIN_MONTHS = 9
+WF_TEST_MONTHS = 3
+MIN_FOLD_TRADES = 15
+MIN_FOLDS_REQUIRED = 3
+MIN_PASS_RATE = 0.60  # 60% of folds must pass
+
+# Slippage (adverse, applied to entry)
+SLIPPAGE_DEFAULT = 0.3  # pips
 
 BREAKEVEN_WR = SL_PIPS / (TP_PIPS + SL_PIPS)  # 0.60
 
@@ -534,19 +552,20 @@ def generate_signal(df_m5: pd.DataFrame, market: dict, pair: str) -> Optional[di
 
 
 # ─────────────────────────────────────────────────────────
-# Trade simulation using 5s data
+# Trade simulation using 5s data (V2: no forward limit)
 # ─────────────────────────────────────────────────────────
 
 def simulate_trade_5s(direction: str, entry_idx: int, entry_price: float,
                       bid_high: np.ndarray, bid_low: np.ndarray,
                       ask_high: np.ndarray, ask_low: np.ndarray,
-                      pip: float, n_total: int) -> Optional[str]:
+                      pip: float, n_total: int) -> Optional[Tuple[str, int]]:
     """
-    Simulate a single trade from entry_idx forward through 5s data.
-    Returns 'TP', 'SL', or None (unresolved).
+    Simulate a single trade from entry_idx forward through ALL remaining 5s data.
+    No artificial forward limit — trade resolves when TP or SL is hit.
+    Returns ('TP', exit_5s_idx), ('SL', exit_5s_idx), or None (unresolved at end of data).
     """
-    max_fwd = min(MAX_FORWARD_5S, n_total - entry_idx)
-    if max_fwd < 100:
+    max_fwd = n_total - entry_idx
+    if max_fwd < 2:
         return None
 
     tp_dist = TP_PIPS * pip
@@ -570,31 +589,37 @@ def simulate_trade_5s(direction: str, entry_idx: int, entry_price: float,
         tp_mask = fwd_low <= tp_level
         sl_mask = fwd_high >= sl_level
 
-    tp_idx = int(np.argmax(tp_mask)) if tp_mask.any() else max_fwd
-    sl_idx = int(np.argmax(sl_mask)) if sl_mask.any() else max_fwd
+    tp_hit = tp_mask.any()
+    sl_hit = sl_mask.any()
 
-    if not tp_mask.any():
-        tp_idx = max_fwd
-    if not sl_mask.any():
-        sl_idx = max_fwd
+    if not tp_hit and not sl_hit:
+        return None  # Neither hit — trade still open at end of data
 
-    if tp_idx <= sl_idx and tp_idx < max_fwd:
-        return "TP"
-    elif sl_idx < max_fwd:
-        return "SL"
+    tp_idx = int(np.argmax(tp_mask)) if tp_hit else max_fwd
+    sl_idx = int(np.argmax(sl_mask)) if sl_hit else max_fwd
+
+    if tp_idx <= sl_idx and tp_hit:
+        return ("TP", entry_idx + tp_idx)
+    elif sl_hit:
+        return ("SL", entry_idx + sl_idx)
     return None
 
 
 # ─────────────────────────────────────────────────────────
-# Main processing loop
+# Main processing loop (V2: concurrent tracking + slippage)
 # ─────────────────────────────────────────────────────────
 
-def process_pair(pair: str, df_5s: pd.DataFrame) -> List[dict]:
+def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3) -> Tuple[List[dict], dict]:
     """
     Process one pair: resample, compute indicators on all timeframes,
-    evaluate signals at each M5 bar, simulate trades.
+    evaluate signals at each M5 bar, simulate trades with:
+      - 1 concurrent trade max per pair (matching bot)
+      - Adverse slippage on entry
+      - No forward candle limit
+    Returns (results_list, stats_dict).
     """
     pip = pip_val(pair)
+    slippage_dist = slippage_pips * pip
     results = []
 
     # ─── Resample to all timeframes ───
@@ -632,7 +657,6 @@ def process_pair(pair: str, df_5s: pd.DataFrame) -> List[dict]:
     n_5s = len(df_5s)
 
     # Build a time → 5s index lookup for fast alignment
-    # Round 5s times to nearest second for matching
     time_to_5s_idx = pd.Series(np.arange(n_5s), index=times_5s)
 
     # ─── Pre-compute Hurst at each H1 bar ───
@@ -647,12 +671,18 @@ def process_pair(pair: str, df_5s: pd.DataFrame) -> List[dict]:
     # ─── Evaluate signal at each M5 bar ───
     m5_times = df_m5_full.index
     n_m5 = len(m5_times)
-    print(f"    Evaluating {n_m5:,} M5 bars...", end="", flush=True)
+    print(f"    Evaluating {n_m5:,} M5 bars (1 trade/pair, slippage={slippage_pips}p)...",
+          end="", flush=True)
     t0 = time_mod.time()
 
     signals_found = 0
     trades_simulated = 0
+    trades_skipped_concurrent = 0
+    trades_unresolved = 0
     last_print = t0
+
+    # Track concurrent trades: 1 max per pair (matching bot's behavior)
+    open_trade_exit_5s_idx = -1
 
     for i in range(max(50, MACD_SLOW + MACD_SIGNAL), n_m5):
         m5_time = m5_times[i]
@@ -664,8 +694,10 @@ def process_pair(pair: str, df_5s: pd.DataFrame) -> List[dict]:
             pct = i / n_m5 * 100
             rate = i / max(elapsed, 0.001)
             eta = (n_m5 - i) / max(rate, 1)
-            print(f"\r    Evaluating {n_m5:,} M5 bars... {pct:.0f}% "
-                  f"({signals_found} signals, {trades_simulated} trades, ETA {eta:.0f}s)", end="", flush=True)
+            print(f"\r    Evaluating {n_m5:,} M5 bars (1 trade/pair, slippage={slippage_pips}p)... "
+                  f"{pct:.0f}% ({signals_found} sig, {trades_simulated} trades, "
+                  f"{trades_skipped_concurrent} concurrent-skip, ETA {eta:.0f}s)",
+                  end="", flush=True)
             last_print = now
 
         # Skip weekends
@@ -696,7 +728,6 @@ def process_pair(pair: str, df_5s: pd.DataFrame) -> List[dict]:
             continue
 
         # Multi-timeframe bias
-        # Get slices up to current time for each TF
         m1_loc = df_m1_full.index.searchsorted(m5_time, side="right")
         m15_loc = df_m15_full.index.searchsorted(m5_time, side="right")
         h1_loc = df_h1_full.index.searchsorted(m5_time, side="right")
@@ -742,18 +773,22 @@ def process_pair(pair: str, df_5s: pd.DataFrame) -> List[dict]:
         signals_found += 1
 
         # ─── Find entry point in 5s data ───
-        # Find the first 5s candle AT or AFTER this M5 bar's close time
         entry_5s_idx = time_to_5s_idx.index.searchsorted(m5_time, side="left")
-        if entry_5s_idx >= n_5s - 100:
+        if entry_5s_idx >= n_5s - 2:
             continue
 
-        # Entry price (ask for buy, bid for sell — matching bot's logic)
-        if sig["direction"] == "buy":
-            entry_price = ask_close_5s[entry_5s_idx]
-        else:
-            entry_price = bid_close_5s[entry_5s_idx]
+        # ─── Check concurrent trade (1 max per pair) ───
+        if entry_5s_idx <= open_trade_exit_5s_idx:
+            trades_skipped_concurrent += 1
+            continue
 
-        # ─── Simulate trade ───
+        # ─── Entry price with adverse slippage ───
+        if sig["direction"] == "buy":
+            entry_price = ask_close_5s[entry_5s_idx] + slippage_dist
+        else:
+            entry_price = bid_close_5s[entry_5s_idx] - slippage_dist
+
+        # ─── Simulate trade (no forward limit) ───
         result = simulate_trade_5s(
             sig["direction"], entry_5s_idx, entry_price,
             bid_high_5s, bid_low_5s, ask_high_5s, ask_low_5s,
@@ -761,8 +796,13 @@ def process_pair(pair: str, df_5s: pd.DataFrame) -> List[dict]:
         )
 
         if result is None:
+            # Trade unresolved at end of data — pair locked for remaining data
+            open_trade_exit_5s_idx = n_5s
+            trades_unresolved += 1
             continue
 
+        outcome, exit_5s_idx = result
+        open_trade_exit_5s_idx = exit_5s_idx
         trades_simulated += 1
 
         # Record result with window info
@@ -775,7 +815,9 @@ def process_pair(pair: str, df_5s: pd.DataFrame) -> List[dict]:
             "direction": sig["direction"],
             "strategy": sig["strategy"],
             "confidence": sig["confidence"],
-            "result": result,
+            "result": outcome,
+            "entry_5s_idx": entry_5s_idx,
+            "exit_5s_idx": exit_5s_idx,
             "session": session,
             "session_quality": session_quality,
             "hurst": hurst,
@@ -784,22 +826,251 @@ def process_pair(pair: str, df_5s: pd.DataFrame) -> List[dict]:
 
     elapsed = time_mod.time() - t0
     print(f"\r    Evaluated {n_m5:,} M5 bars in {elapsed:.0f}s — "
-          f"{signals_found} signals, {trades_simulated} trades simulated")
+          f"{signals_found} signals, {trades_simulated} trades, "
+          f"{trades_skipped_concurrent} skipped (concurrent), "
+          f"{trades_unresolved} unresolved")
 
-    return results
+    pair_info = {
+        "signals": signals_found,
+        "trades": trades_simulated,
+        "skipped_concurrent": trades_skipped_concurrent,
+        "unresolved": trades_unresolved,
+    }
+
+    return results, pair_info
+
+
+# ─────────────────────────────────────────────────────────
+# Walk-forward validation
+# ─────────────────────────────────────────────────────────
+
+def walk_forward_validate(trades: List[dict], train_months: int = 9,
+                          test_months: int = 3, min_fold_trades: int = 15) -> List[dict]:
+    """
+    Walk-forward validation for a list of trades (one pair, one window).
+    Uses expanding window: anchored start, expanding training set.
+    Test periods are non-overlapping, sequential.
+
+    Returns list of fold dicts with train/test stats.
+    """
+    if not trades:
+        return []
+
+    # Get all unique (year, month) tuples, sorted
+    all_months = sorted(set((t['date'].year, t['date'].month) for t in trades))
+
+    if len(all_months) < train_months + test_months:
+        return []
+
+    # Index trades by month for fast lookup
+    trades_by_month = defaultdict(list)
+    for t in trades:
+        trades_by_month[(t['date'].year, t['date'].month)].append(t)
+
+    folds = []
+    test_start_idx = train_months
+
+    while test_start_idx + test_months <= len(all_months):
+        train_month_keys = set(all_months[:test_start_idx])
+        test_month_keys = all_months[test_start_idx:test_start_idx + test_months]
+        test_month_set = set(test_month_keys)
+
+        train_trades = []
+        for mk in train_month_keys:
+            train_trades.extend(trades_by_month.get(mk, []))
+
+        test_trades = []
+        for mk in test_month_set:
+            test_trades.extend(trades_by_month.get(mk, []))
+
+        train_n = len(train_trades)
+        test_n = len(test_trades)
+
+        train_tp = sum(1 for t in train_trades if t['result'] == 'TP')
+        test_tp = sum(1 for t in test_trades if t['result'] == 'TP')
+
+        train_wr = train_tp / train_n if train_n > 0 else 0
+        test_wr = test_tp / test_n if test_n > 0 else 0
+
+        train_ev = train_wr * TP_PIPS - (1 - train_wr) * SL_PIPS if train_n > 0 else 0
+        test_ev = test_wr * TP_PIPS - (1 - test_wr) * SL_PIPS if test_n > 0 else 0
+
+        # Fold is counted if test has enough trades
+        counted = test_n >= min_fold_trades
+
+        # Fold passes if BOTH train and test beat breakeven WR
+        passed = counted and train_wr > BREAKEVEN_WR and test_wr > BREAKEVEN_WR
+
+        # Label for this test period
+        y0, m0 = test_month_keys[0]
+        y1, m1 = test_month_keys[-1]
+        label = f"{y0}-{m0:02d}→{y1}-{m1:02d}"
+
+        folds.append({
+            'label': label,
+            'train_n': train_n, 'train_tp': train_tp,
+            'train_wr': train_wr, 'train_ev': train_ev,
+            'test_n': test_n, 'test_tp': test_tp,
+            'test_wr': test_wr, 'test_ev': test_ev,
+            'counted': counted, 'passed': passed,
+        })
+
+        test_start_idx += test_months
+
+    # Also handle partial last fold if remaining months >= 1
+    if test_start_idx < len(all_months):
+        remaining = all_months[test_start_idx:]
+        if len(remaining) >= 1:
+            train_month_keys = set(all_months[:test_start_idx])
+            test_month_set = set(remaining)
+
+            train_trades = []
+            for mk in train_month_keys:
+                train_trades.extend(trades_by_month.get(mk, []))
+            test_trades = []
+            for mk in test_month_set:
+                test_trades.extend(trades_by_month.get(mk, []))
+
+            train_n = len(train_trades)
+            test_n = len(test_trades)
+            train_tp = sum(1 for t in train_trades if t['result'] == 'TP')
+            test_tp = sum(1 for t in test_trades if t['result'] == 'TP')
+            train_wr = train_tp / train_n if train_n > 0 else 0
+            test_wr = test_tp / test_n if test_n > 0 else 0
+            train_ev = train_wr * TP_PIPS - (1 - train_wr) * SL_PIPS if train_n > 0 else 0
+            test_ev = test_wr * TP_PIPS - (1 - test_wr) * SL_PIPS if test_n > 0 else 0
+
+            counted = test_n >= min_fold_trades
+            passed = counted and train_wr > BREAKEVEN_WR and test_wr > BREAKEVEN_WR
+
+            y0, m0 = remaining[0]
+            y1, m1 = remaining[-1]
+            label = f"{y0}-{m0:02d}→{y1}-{m1:02d}"
+
+            folds.append({
+                'label': label,
+                'train_n': train_n, 'train_tp': train_tp,
+                'train_wr': train_wr, 'train_ev': train_ev,
+                'test_n': test_n, 'test_tp': test_tp,
+                'test_wr': test_wr, 'test_ev': test_ev,
+                'counted': counted, 'passed': passed,
+            })
+
+    return folds
+
+
+# ─────────────────────────────────────────────────────────
+# Drawdown & streak analysis
+# ─────────────────────────────────────────────────────────
+
+def compute_drawdown(trades: List[dict]) -> dict:
+    """
+    Compute drawdown and streak stats from chronologically-ordered trades.
+    Each trade is +TP_PIPS (win) or -SL_PIPS (loss).
+    """
+    if not trades:
+        return {'max_drawdown_pips': 0, 'max_consecutive_losses': 0,
+                'profit_factor': 0, 'total_pnl': 0, 'n_trades': 0}
+
+    results = [t['result'] for t in trades]
+    pnl = np.array([TP_PIPS if r == 'TP' else -SL_PIPS for r in results], dtype=np.float64)
+    cum_pnl = np.cumsum(pnl)
+
+    # Max drawdown
+    peak = np.maximum.accumulate(cum_pnl)
+    drawdown = peak - cum_pnl
+    max_dd = float(np.max(drawdown)) if len(drawdown) > 0 else 0.0
+
+    # Max consecutive losses
+    max_consec_loss = 0
+    current_consec = 0
+    for r in results:
+        if r == 'SL':
+            current_consec += 1
+            max_consec_loss = max(max_consec_loss, current_consec)
+        else:
+            current_consec = 0
+
+    # Max consecutive wins
+    max_consec_win = 0
+    current_consec = 0
+    for r in results:
+        if r == 'TP':
+            current_consec += 1
+            max_consec_win = max(max_consec_win, current_consec)
+        else:
+            current_consec = 0
+
+    # Profit factor
+    total_profit = sum(TP_PIPS for r in results if r == 'TP')
+    total_loss = sum(SL_PIPS for r in results if r == 'SL')
+    profit_factor = total_profit / total_loss if total_loss > 0 else float('inf')
+
+    # Worst month (by month PnL)
+    monthly_pnl = defaultdict(float)
+    for t in trades:
+        key = (t['date'].year, t['date'].month)
+        monthly_pnl[key] += TP_PIPS if t['result'] == 'TP' else -SL_PIPS
+    worst_month_pnl = min(monthly_pnl.values()) if monthly_pnl else 0
+    worst_month_key = min(monthly_pnl, key=monthly_pnl.get) if monthly_pnl else None
+    best_month_pnl = max(monthly_pnl.values()) if monthly_pnl else 0
+
+    return {
+        'max_drawdown_pips': max_dd,
+        'max_consecutive_losses': max_consec_loss,
+        'max_consecutive_wins': max_consec_win,
+        'profit_factor': profit_factor,
+        'total_pnl': float(cum_pnl[-1]) if len(cum_pnl) > 0 else 0.0,
+        'n_trades': len(results),
+        'worst_month_pnl': worst_month_pnl,
+        'worst_month': f"{worst_month_key[0]}-{worst_month_key[1]:02d}" if worst_month_key else "N/A",
+        'best_month_pnl': best_month_pnl,
+        'n_months': len(monthly_pnl),
+    }
 
 
 # ─────────────────────────────────────────────────────────
 # Reporting
 # ─────────────────────────────────────────────────────────
 
-def print_window_ranking(results: List[dict], title: str = ""):
-    """Print window rankings from results."""
-    if not results:
-        print(f"  No results to display.")
-        return []
+def print_strategy_breakdown(results: List[dict]):
+    """Show how each strategy performs overall."""
+    print(f"\n{'='*120}")
+    print(f"  STRATEGY PERFORMANCE (with concurrent trade limit + slippage)")
+    print(f"{'='*120}")
 
-    by_window = defaultdict(lambda: {"tp": 0, "sl": 0, "pairs": defaultdict(lambda: {"tp": 0, "sl": 0}),
+    by_strat = defaultdict(lambda: {"tp": 0, "sl": 0})
+    for r in results:
+        if r["result"] == "TP":
+            by_strat[r["strategy"]]["tp"] += 1
+        else:
+            by_strat[r["strategy"]]["sl"] += 1
+
+    print(f"  {'Strategy':<25} {'WR%':>6} {'EV(p)':>7} {'Trades':>7} {'TP':>6} {'SL':>6} {'PF':>5}")
+    print(f"  {'-'*70}")
+    for strat, d in sorted(by_strat.items(), key=lambda x: -(x[1]["tp"]/(x[1]["tp"]+x[1]["sl"]) if x[1]["tp"]+x[1]["sl"]>0 else 0)):
+        total = d["tp"] + d["sl"]
+        wr = d["tp"] / total if total > 0 else 0
+        ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
+        pf = (d["tp"] * TP_PIPS) / (d["sl"] * SL_PIPS) if d["sl"] > 0 else float('inf')
+        print(f"  {strat:<25} {wr*100:>5.1f}% {ev:>+6.1f}p {total:>7} {d['tp']:>6} {d['sl']:>6} {pf:>5.2f}")
+
+    total_tp = sum(d["tp"] for d in by_strat.values())
+    total_sl = sum(d["sl"] for d in by_strat.values())
+    total = total_tp + total_sl
+    wr = total_tp / total if total > 0 else 0
+    ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
+    pf = (total_tp * TP_PIPS) / (total_sl * SL_PIPS) if total_sl > 0 else float('inf')
+    print(f"  {'-'*70}")
+    print(f"  {'TOTAL':<25} {wr*100:>5.1f}% {ev:>+6.1f}p {total:>7} {total_tp:>6} {total_sl:>6} {pf:>5.2f}")
+
+
+def print_pair_window_ranking(results: List[dict], pair: str):
+    """Print window ranking for a single pair."""
+    if not results:
+        return
+
+    by_window = defaultdict(lambda: {"tp": 0, "sl": 0,
                                       "strategies": defaultdict(lambda: {"tp": 0, "sl": 0})})
 
     for r in results:
@@ -807,11 +1078,9 @@ def print_window_ranking(results: List[dict], title: str = ""):
         d = by_window[w]
         if r["result"] == "TP":
             d["tp"] += 1
-            d["pairs"][r["pair"]]["tp"] += 1
             d["strategies"][r["strategy"]]["tp"] += 1
         else:
             d["sl"] += 1
-            d["pairs"][r["pair"]]["sl"] += 1
             d["strategies"][r["strategy"]]["sl"] += 1
 
     stats = []
@@ -819,32 +1088,39 @@ def print_window_ranking(results: List[dict], title: str = ""):
         total = d["tp"] + d["sl"]
         wr = d["tp"] / total if total > 0 else 0
         ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
-        pairs_positive = sum(1 for p, pd in d["pairs"].items()
-                            if (pd["tp"] / (pd["tp"] + pd["sl"])) > BREAKEVEN_WR
-                            and (pd["tp"] + pd["sl"]) >= 5)
+
+        # Strategy breakdown string
+        strat_parts = []
+        for sname in ["volatility_breakout", "momentum_pullback", "trend_following"]:
+            sd = d["strategies"].get(sname, {"tp": 0, "sl": 0})
+            sn = sd["tp"] + sd["sl"]
+            if sn > 0:
+                swr = sd["tp"] / sn
+                sev = swr * TP_PIPS - (1 - swr) * SL_PIPS
+                abbrev = {"volatility_breakout": "VB", "momentum_pullback": "MP",
+                          "trend_following": "TF"}[sname]
+                strat_parts.append(f"{abbrev}:{sn}@{sev:+.0f}p")
+
         stats.append({
             "window": window, "label": window_label(*window),
             "wr": wr, "ev": ev, "n": total, "tp": d["tp"], "sl": d["sl"],
-            "pairs_positive": pairs_positive,
-            "pairs_total": len(d["pairs"]),
-            "pair_details": dict(d["pairs"]),
-            "strategy_details": dict(d["strategies"]),
+            "strat_str": " | ".join(strat_parts),
         })
 
     stats.sort(key=lambda s: s["ev"], reverse=True)
 
-    print(f"\n{'='*110}")
-    print(f"  {title}")
+    print(f"\n{'='*120}")
+    print(f"  {pair} — Per-Pair Window Rankings")
     print(f"  Breakeven WR for TP+{TP_PIPS}/SL-{SL_PIPS}: {BREAKEVEN_WR*100:.0f}%")
-    print(f"{'='*110}")
+    print(f"{'='*120}")
     print(f"  {'Window':<14} {'WR%':>6} {'EV(p)':>7} {'Trades':>7} {'TP':>5} {'SL':>5} "
-          f"{'Pairs+':>6} {'Status':>12}")
-    print(f"  {'-'*75}")
+          f"{'Status':>12}  Strategy Breakdown")
+    print(f"  {'-'*110}")
 
     for s in stats:
         if s["ev"] > 0 and s["n"] >= MIN_SAMPLE_SIZE:
             status = "PROFITABLE"
-        elif s["ev"] > 0:
+        elif s["ev"] > 0 and s["n"] >= 30:
             status = "positive"
         elif s["ev"] > -5:
             status = "marginal"
@@ -854,122 +1130,203 @@ def print_window_ranking(results: List[dict], title: str = ""):
         marker = " ***" if status == "PROFITABLE" else ""
         print(f"  {s['label']:<14} {s['wr']*100:>5.1f}% {s['ev']:>+6.1f}p {s['n']:>7} "
               f"{s['tp']:>5} {s['sl']:>5} "
-              f"{s['pairs_positive']:>3}/{s['pairs_total']:<2} "
-              f"{status:>12}{marker}")
-
-    return stats
+              f"{status:>12}{marker}  {s['strat_str']}")
 
 
-def print_recommended_config(stats: List[dict], all_results: List[dict]):
-    """Print the validated window config."""
-    profitable = [s for s in stats if s["ev"] > 0 and s["n"] >= MIN_SAMPLE_SIZE]
-
-    if not profitable:
-        print("\n  No windows meet profitability + sample size criteria.")
-        profitable = [s for s in stats if s["ev"] > 0 and s["n"] >= 10]
-        if not profitable:
-            print("  No windows with positive EV at all.")
-            return
-
-    # Cross-validate
-    all_dates = sorted(set(r["date"] for r in all_results))
-    split = int(len(all_dates) * 0.7)
-    train_dates = set(all_dates[:split])
-    test_dates = set(all_dates[split:])
-
-    print(f"\n{'='*110}")
-    print(f"  CROSS-VALIDATION (Train: first 70% = {len(train_dates)} days, Test: last 30% = {len(test_dates)} days)")
-    print(f"{'='*110}")
-    print(f"  {'Window':<14} {'Full WR':>7} {'Full EV':>8} {'Full N':>7} │ "
-          f"{'Train WR':>8} {'Train EV':>9} │ {'Test WR':>8} {'Test EV':>9} │ {'Valid?':>8}")
-    print(f"  {'-'*100}")
+def validate_pair_windows(pair_results: List[dict], pair: str,
+                          train_months: int, test_months: int,
+                          min_fold_trades: int, min_pass_rate: float,
+                          min_total_n: int) -> List[dict]:
+    """
+    For one pair, walk-forward validate each window.
+    Returns list of validated pair-window entries sorted by overall test EV.
+    """
+    # Group trades by window
+    by_window = defaultdict(list)
+    for r in pair_results:
+        by_window[r['window']].append(r)
 
     validated = []
-    for s in profitable:
-        w = s["window"]
-        train_r = [r for r in all_results if r["window"] == w and r["date"] in train_dates]
-        test_r = [r for r in all_results if r["window"] == w and r["date"] in test_dates]
+    considered = []
 
-        train_tp = sum(1 for r in train_r if r["result"] == "TP")
-        train_n = len(train_r)
-        train_wr = train_tp / train_n if train_n > 0 else 0
-        train_ev = train_wr * TP_PIPS - (1 - train_wr) * SL_PIPS if train_n > 0 else 0
-
-        test_tp = sum(1 for r in test_r if r["result"] == "TP")
-        test_n = len(test_r)
-        test_wr = test_tp / test_n if test_n > 0 else 0
-        test_ev = test_wr * TP_PIPS - (1 - test_wr) * SL_PIPS if test_n > 0 else 0
-
-        valid = "YES" if test_ev > 0 and test_n >= 10 else ("maybe" if test_ev > 0 else "NO")
-
-        print(f"  {s['label']:<14} {s['wr']*100:>6.1f}% {s['ev']:>+7.1f}p {s['n']:>7} │ "
-              f"{train_wr*100:>7.1f}% {train_ev:>+8.1f}p │ "
-              f"{test_wr*100:>7.1f}% {test_ev:>+8.1f}p │ {valid:>8}")
-
-        if valid == "YES":
-            validated.append((s, train_ev, test_ev, test_n))
-
-    # Print config
-    print(f"\n{'='*110}")
-    print(f"  RECOMMENDED CONFIG ({len(validated)} validated windows)")
-    print(f"{'='*110}")
-
-    if validated:
-        print(f"\n  # Paste into bot's Config class:")
-        print(f"  USE_TIME_WINDOWS = True")
-        print(f"  TRADE_WINDOWS = [")
-        for s, train_ev, test_ev, test_n in validated:
-            h, hh = s["window"]
-            print(f"      ({h}, {hh}),  # {s['label']}: "
-                  f"WR={s['wr']*100:.0f}%, EV={s['ev']:+.1f}p, N={s['n']}, "
-                  f"train={train_ev:+.1f}p, test={test_ev:+.1f}p")
-        print(f"  ]")
-
-        # Per-pair detail for validated windows
-        print(f"\n  Per-pair breakdown for validated windows:")
-        for s, _, _, _ in validated:
-            print(f"\n    {s['label']}:")
-            for p, pd in sorted(s["pair_details"].items(), key=lambda x: -(x[1]["tp"]/(x[1]["tp"]+x[1]["sl"]) if x[1]["tp"]+x[1]["sl"]>0 else 0)):
-                t = pd["tp"] + pd["sl"]
-                if t > 0:
-                    wr = pd["tp"] / t
-                    ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
-                    bar = "+" * max(0, int(ev/3)) if ev > 0 else "-" * max(0, int(-ev/3))
-                    print(f"      {p:<10} WR={wr*100:>5.1f}%  EV={ev:>+6.1f}p  N={t:>4}  {bar}")
-    else:
-        print("\n  No windows validated in both train and test periods.")
-        print("  This means the profitable windows in-sample don't hold out-of-sample.")
-        print("  Consider: the bot's signal may not have a time-of-day edge.")
-
-
-def print_strategy_breakdown(results: List[dict]):
-    """Show how each strategy performs overall."""
-    print(f"\n{'='*110}")
-    print(f"  STRATEGY PERFORMANCE")
-    print(f"{'='*110}")
-
-    by_strat = defaultdict(lambda: {"tp": 0, "sl": 0})
-    for r in results:
-        if r["result"] == "TP":
-            by_strat[r["strategy"]]["tp"] += 1
-        else:
-            by_strat[r["strategy"]]["sl"] += 1
-
-    print(f"  {'Strategy':<25} {'WR%':>6} {'EV(p)':>7} {'Trades':>7} {'TP':>5} {'SL':>5}")
-    print(f"  {'-'*60}")
-    for strat, d in sorted(by_strat.items(), key=lambda x: -(x[1]["tp"]/(x[1]["tp"]+x[1]["sl"]) if x[1]["tp"]+x[1]["sl"]>0 else 0)):
-        total = d["tp"] + d["sl"]
-        wr = d["tp"] / total if total > 0 else 0
+    for window in sorted(by_window.keys()):
+        trades = sorted(by_window[window], key=lambda t: t['time'])
+        n = len(trades)
+        tp = sum(1 for t in trades if t['result'] == 'TP')
+        wr = tp / n if n > 0 else 0
         ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
-        print(f"  {strat:<25} {wr*100:>5.1f}% {ev:>+6.1f}p {total:>7} {d['tp']:>5} {d['sl']:>5}")
 
-    total_tp = sum(d["tp"] for d in by_strat.values())
-    total_sl = sum(d["sl"] for d in by_strat.values())
-    total = total_tp + total_sl
-    wr = total_tp / total if total > 0 else 0
-    ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
-    print(f"  {'-'*60}")
-    print(f"  {'TOTAL':<25} {wr*100:>5.1f}% {ev:>+6.1f}p {total:>7} {total_tp:>5} {total_sl:>5}")
+        # Skip windows that don't meet basic full-dataset criteria
+        if n < min_total_n or wr <= BREAKEVEN_WR:
+            continue
+
+        considered.append((window, n, wr, ev))
+
+        # Walk-forward validate
+        folds = walk_forward_validate(trades, train_months, test_months, min_fold_trades)
+
+        counted_folds = [f for f in folds if f['counted']]
+        passed_folds = [f for f in counted_folds if f['passed']]
+
+        if len(counted_folds) < MIN_FOLDS_REQUIRED:
+            continue
+
+        pass_rate = len(passed_folds) / len(counted_folds)
+        if pass_rate < min_pass_rate:
+            continue
+
+        # Overall test stats (sum across all counted folds)
+        total_test_tp = sum(f['test_tp'] for f in counted_folds)
+        total_test_n = sum(f['test_n'] for f in counted_folds)
+        overall_test_wr = total_test_tp / total_test_n if total_test_n > 0 else 0
+        overall_test_ev = overall_test_wr * TP_PIPS - (1 - overall_test_wr) * SL_PIPS
+
+        # Must also be profitable across all test folds combined
+        if overall_test_wr <= BREAKEVEN_WR:
+            continue
+
+        # Compute drawdown
+        dd = compute_drawdown(trades)
+
+        validated.append({
+            'pair': pair,
+            'window': window,
+            'label': window_label(*window),
+            'wr': wr, 'ev': ev, 'n': n, 'tp': tp, 'sl': n - tp,
+            'folds': folds,
+            'counted_folds': len(counted_folds),
+            'passed_folds': len(passed_folds),
+            'pass_rate': pass_rate,
+            'overall_test_wr': overall_test_wr,
+            'overall_test_ev': overall_test_ev,
+            'overall_test_n': total_test_n,
+            'drawdown': dd,
+        })
+
+    # Sort by overall test EV (out-of-sample performance)
+    validated.sort(key=lambda v: v['overall_test_ev'], reverse=True)
+    return validated
+
+
+def print_walk_forward_detail(validated: List[dict], pair: str):
+    """Print detailed walk-forward results for one pair."""
+    print(f"\n{'='*120}")
+    print(f"  {pair} — WALK-FORWARD VALIDATION")
+    print(f"  Expanding window: train from start, {WF_TEST_MONTHS}-month non-overlapping test periods")
+    print(f"  Pass criteria: BOTH train AND test WR > {BREAKEVEN_WR*100:.0f}% per fold, "
+          f">={MIN_PASS_RATE*100:.0f}% of folds pass, overall test WR > {BREAKEVEN_WR*100:.0f}%")
+    print(f"{'='*120}")
+
+    if not validated:
+        print(f"  No windows passed walk-forward validation for {pair}.")
+        return
+
+    for v in validated:
+        print(f"\n  {v['label']}  |  Full: WR={v['wr']*100:.1f}% EV={v['ev']:+.1f}p N={v['n']}  |  "
+              f"Test: WR={v['overall_test_wr']*100:.1f}% EV={v['overall_test_ev']:+.1f}p N={v['overall_test_n']}  |  "
+              f"Folds: {v['passed_folds']}/{v['counted_folds']} passed ({v['pass_rate']*100:.0f}%)")
+        print(f"  {'Fold':<16} {'Train':>7} {'Trn WR':>7} {'Trn EV':>8} │ "
+              f"{'Test':>6} {'Tst WR':>7} {'Tst EV':>8} │ {'Result':>8}")
+        print(f"  {'-'*90}")
+
+        for f in v['folds']:
+            if f['counted']:
+                result_str = "PASS ✓" if f['passed'] else "FAIL ✗"
+            else:
+                result_str = f"skip (n={f['test_n']})"
+
+            print(f"  {f['label']:<16} {f['train_n']:>7} {f['train_wr']*100:>6.1f}% {f['train_ev']:>+7.1f}p │ "
+                  f"{f['test_n']:>6} {f['test_wr']*100:>6.1f}% {f['test_ev']:>+7.1f}p │ {result_str:>8}")
+
+        # Drawdown summary
+        dd = v['drawdown']
+        print(f"  Drawdown: max={dd['max_drawdown_pips']:.0f}p | "
+              f"max consec losses={dd['max_consecutive_losses']} | "
+              f"profit factor={dd['profit_factor']:.2f} | "
+              f"worst month={dd['worst_month']} ({dd['worst_month_pnl']:+.0f}p)")
+
+
+def print_recommended_config(all_validated: Dict[str, List[dict]]):
+    """Print the final recommended PAIR_WINDOWS config."""
+    print(f"\n{'='*120}")
+    print(f"  RECOMMENDED PAIR_WINDOWS CONFIG")
+    print(f"  Walk-forward validated, per-pair per-window, with drawdown analysis")
+    print(f"{'='*120}")
+
+    # Count total validated
+    total_validated = sum(len(v) for v in all_validated.values())
+    if total_validated == 0:
+        print(f"\n  No pair-windows passed walk-forward validation.")
+        print(f"  The bot's signal logic may not have a robust time-of-day edge with these filters.")
+        return
+
+    # Print config dict
+    print(f"\n  # Paste into bot's Config class:")
+    print(f"  USE_TIME_WINDOWS = True")
+    print(f"  USE_PAIR_WINDOWS = True")
+    print(f"  PAIR_WINDOWS = {{")
+
+    for pair in sorted(all_validated.keys()):
+        windows = all_validated[pair]
+        if not windows:
+            continue
+        window_strs = []
+        for v in windows:
+            h, hh = v['window']
+            window_strs.append(f"({h}, {hh})")
+        print(f"      \"{pair}\": [{', '.join(window_strs)}],")
+    print(f"  }}")
+
+    # Detailed summary table
+    print(f"\n  {'Pair':<10} {'Window':<14} {'Full WR':>7} {'Full EV':>8} {'N':>6} │ "
+          f"{'Test WR':>7} {'Test EV':>8} {'Folds':>7} │ "
+          f"{'MaxDD':>7} {'MaxLoss':>8} {'PF':>5}")
+    print(f"  {'-'*110}")
+
+    total_n = 0
+    total_test_n = 0
+
+    for pair in sorted(all_validated.keys()):
+        windows = all_validated[pair]
+        for v in windows:
+            dd = v['drawdown']
+            print(f"  {pair:<10} {v['label']:<14} {v['wr']*100:>6.1f}% {v['ev']:>+7.1f}p {v['n']:>6} │ "
+                  f"{v['overall_test_wr']*100:>6.1f}% {v['overall_test_ev']:>+7.1f}p "
+                  f"{v['passed_folds']}/{v['counted_folds']:>3} │ "
+                  f"{dd['max_drawdown_pips']:>6.0f}p {dd['max_consecutive_losses']:>7}L "
+                  f"{dd['profit_factor']:>5.2f}")
+            total_n += v['n']
+            total_test_n += v['overall_test_n']
+
+    print(f"\n  Total validated pair-windows: {total_validated}")
+    print(f"  Total trades in validated windows: {total_n:,}")
+    print(f"  Total out-of-sample test trades: {total_test_n:,}")
+
+    # Global test stats
+    all_test_tp = 0
+    all_test_n = 0
+    for pair in all_validated:
+        for v in all_validated[pair]:
+            counted = [f for f in v['folds'] if f['counted']]
+            all_test_tp += sum(f['test_tp'] for f in counted)
+            all_test_n += sum(f['test_n'] for f in counted)
+
+    if all_test_n > 0:
+        global_test_wr = all_test_tp / all_test_n
+        global_test_ev = global_test_wr * TP_PIPS - (1 - global_test_wr) * SL_PIPS
+        print(f"\n  GLOBAL OUT-OF-SAMPLE: WR={global_test_wr*100:.1f}%, EV={global_test_ev:+.1f}p, N={all_test_n:,}")
+
+    # Cross-pair window summary (which windows are profitable for multiple pairs)
+    print(f"\n  Cross-pair window coverage:")
+    window_pairs = defaultdict(list)
+    for pair in all_validated:
+        for v in all_validated[pair]:
+            window_pairs[v['window']].append((pair, v['overall_test_ev']))
+
+    for w in sorted(window_pairs.keys()):
+        pairs = window_pairs[w]
+        pairs_str = ", ".join(f"{p}({ev:+.1f}p)" for p, ev in sorted(pairs, key=lambda x: -x[1]))
+        print(f"    {window_label(*w)}: {len(pairs)} pairs — {pairs_str}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -977,27 +1334,54 @@ def print_strategy_breakdown(results: List[dict]):
 # ─────────────────────────────────────────────────────────
 
 def main():
-    global MIN_SAMPLE_SIZE
+    global MIN_SAMPLE_SIZE, WF_TRAIN_MONTHS, WF_TEST_MONTHS, MIN_FOLD_TRADES
+    global MIN_FOLDS_REQUIRED, MIN_PASS_RATE, SLIPPAGE_DEFAULT
 
-    parser = argparse.ArgumentParser(description="Window Optimizer using bot's actual signal logic")
+    parser = argparse.ArgumentParser(
+        description="Window Optimizer V2 — per-pair per-window, walk-forward validated")
     parser.add_argument("--data-dir", required=True, help="Directory with parquet files")
     parser.add_argument("--start", default=None, help="Start date YYYY-MM-DD")
     parser.add_argument("--end", default=None, help="End date YYYY-MM-DD")
     parser.add_argument("--pairs", nargs="+", default=None, help="Pairs to test")
-    parser.add_argument("--min-samples", type=int, default=MIN_SAMPLE_SIZE)
+    parser.add_argument("--slippage", type=float, default=SLIPPAGE_DEFAULT,
+                        help=f"Adverse slippage in pips (default: {SLIPPAGE_DEFAULT})")
+    parser.add_argument("--min-samples", type=int, default=MIN_SAMPLE_SIZE,
+                        help=f"Min trades for a pair-window (default: {MIN_SAMPLE_SIZE})")
+    parser.add_argument("--wf-train", type=int, default=WF_TRAIN_MONTHS,
+                        help=f"Walk-forward initial training months (default: {WF_TRAIN_MONTHS})")
+    parser.add_argument("--wf-test", type=int, default=WF_TEST_MONTHS,
+                        help=f"Walk-forward test period months (default: {WF_TEST_MONTHS})")
+    parser.add_argument("--min-fold-trades", type=int, default=MIN_FOLD_TRADES,
+                        help=f"Min trades per WF test fold (default: {MIN_FOLD_TRADES})")
+    parser.add_argument("--min-pass-rate", type=float, default=MIN_PASS_RATE,
+                        help=f"Min fraction of folds that must pass (default: {MIN_PASS_RATE})")
     args = parser.parse_args()
 
     MIN_SAMPLE_SIZE = args.min_samples
+    WF_TRAIN_MONTHS = args.wf_train
+    WF_TEST_MONTHS = args.wf_test
+    MIN_FOLD_TRADES = args.min_fold_trades
+    MIN_PASS_RATE = args.min_pass_rate
+    SLIPPAGE_DEFAULT = args.slippage
 
-    print("=" * 110)
-    print("40/60 BOT — WINDOW OPTIMIZER (using bot's actual signal logic)")
-    print("Strategies: momentum_pullback, trend_following, volatility_breakout")
-    print(f"Filters: Hurst>{HURST_THRESHOLD}, MTF bias>0.5, ATR {MIN_ATR_PIPS}-{MAX_ATR_PIPS}p, session>0.5")
-    print(f"TP/SL: +{TP_PIPS}/-{SL_PIPS} pips | Confidence threshold: {CONFIDENCE_THRESHOLD}")
-    print(f"Requires: talib, pandas, numpy, pyarrow")
+    print("=" * 120)
+    print("40/60 BOT — WINDOW OPTIMIZER V2 (per-pair per-window, walk-forward validated)")
+    print("=" * 120)
+    print(f"  Strategies: momentum_pullback, trend_following, volatility_breakout")
+    print(f"  Filters: Hurst>{HURST_THRESHOLD}, MTF bias>0.5, ATR {MIN_ATR_PIPS}-{MAX_ATR_PIPS}p, session>0.5")
+    print(f"  TP/SL: +{TP_PIPS}/-{SL_PIPS} pips | Confidence threshold: {CONFIDENCE_THRESHOLD}")
+    print(f"  Breakeven WR: {BREAKEVEN_WR*100:.0f}%")
+    print(f"  Concurrent trades: 1 per pair (matching bot)")
+    print(f"  Adverse slippage: {args.slippage} pips on entry")
+    print(f"  Trade forward limit: NONE (trades resolve fully)")
+    print(f"  Walk-forward: {WF_TRAIN_MONTHS}m initial train, {WF_TEST_MONTHS}m test periods, "
+          f"expanding window")
+    print(f"  Validation: both train+test WR>{BREAKEVEN_WR*100:.0f}% per fold, "
+          f">={MIN_PASS_RATE*100:.0f}% folds pass")
+    print(f"  Min samples: {MIN_SAMPLE_SIZE} total, {MIN_FOLD_TRADES} per test fold")
     if args.start:
-        print(f"Date range: {args.start} to {args.end or 'latest'}")
-    print("=" * 110)
+        print(f"  Date range: {args.start} to {args.end or 'latest'}")
+    print("=" * 120)
 
     pairs = args.pairs or ALL_PAIRS
     available = []
@@ -1011,6 +1395,8 @@ def main():
     print(f"\nPairs: {', '.join(p for p, _ in available)}")
 
     all_results = []
+    pair_results_map = {}
+    pair_info_map = {}
 
     for pair, path in available:
         print(f"\n{'─'*80}")
@@ -1022,8 +1408,10 @@ def main():
         df_5s = load_5s(path, args.start, args.end)
         print(f" {len(df_5s):,} rows in {time_mod.time()-t0:.1f}s")
 
-        results = process_pair(pair, df_5s)
+        results, pair_info = process_pair(pair, df_5s, slippage_pips=args.slippage)
         all_results.extend(results)
+        pair_results_map[pair] = results
+        pair_info_map[pair] = pair_info
 
         # Quick per-pair summary
         if results:
@@ -1040,25 +1428,54 @@ def main():
         print("\nNo trades generated. The bot's signal logic produced no signals in this data range.")
         return
 
-    # Overall stats
+    # ─── Processing summary ───
+    print(f"\n{'='*120}")
+    print(f"  PROCESSING SUMMARY")
+    print(f"{'='*120}")
+    for pair in [p for p, _ in available]:
+        info = pair_info_map.get(pair, {})
+        print(f"  {pair:<10}: {info.get('signals', 0):>6} signals, "
+              f"{info.get('trades', 0):>6} trades, "
+              f"{info.get('skipped_concurrent', 0):>6} skipped (concurrent), "
+              f"{info.get('unresolved', 0):>4} unresolved")
+
+    # ─── Strategy breakdown ───
     print_strategy_breakdown(all_results)
 
-    # Per-pair rankings
+    # ─── Per-pair window rankings ───
     for pair, _ in available:
-        pair_results = [r for r in all_results if r["pair"] == pair]
-        if pair_results:
-            print_window_ranking(pair_results, f"{pair} — Window Rankings")
+        results = pair_results_map.get(pair, [])
+        if results:
+            print_pair_window_ranking(results, pair)
 
-    # Global ranking
-    stats = print_window_ranking(all_results, "GLOBAL WINDOW RANKING (all pairs combined)")
+    # ─── Walk-forward validation per pair ───
+    all_validated = {}
 
-    # Recommended config with cross-validation
-    if stats:
-        print_recommended_config(stats, all_results)
+    for pair, _ in available:
+        results = pair_results_map.get(pair, [])
+        if not results:
+            all_validated[pair] = []
+            continue
 
-    print(f"\n{'='*110}")
+        validated = validate_pair_windows(
+            results, pair,
+            train_months=WF_TRAIN_MONTHS,
+            test_months=WF_TEST_MONTHS,
+            min_fold_trades=MIN_FOLD_TRADES,
+            min_pass_rate=MIN_PASS_RATE,
+            min_total_n=MIN_SAMPLE_SIZE,
+        )
+        all_validated[pair] = validated
+
+        # Print walk-forward detail
+        print_walk_forward_detail(validated, pair)
+
+    # ─── Recommended config ───
+    print_recommended_config(all_validated)
+
+    print(f"\n{'='*120}")
     print("DONE")
-    print(f"{'='*110}")
+    print(f"{'='*120}")
 
 
 if __name__ == "__main__":
