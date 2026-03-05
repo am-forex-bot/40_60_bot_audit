@@ -795,10 +795,15 @@ def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3,
             continue
 
         # Multi-timeframe bias
+        # Use side="left" to get the index of the CURRENT candle's start,
+        # then slice [:loc] to EXCLUDE it (only completed candles).
+        # This matches the live bot which only uses complete candles.
+        # Exception: M1 and M5 — the current bar is close enough to complete
+        # (5s and 5min resolution) that including it is acceptable.
         m1_loc = df_m1_full.index.searchsorted(m5_time, side="right")
-        m15_loc = df_m15_full.index.searchsorted(m5_time, side="right")
-        h1_loc = df_h1_full.index.searchsorted(m5_time, side="right")
-        h4_loc = df_h4_full.index.searchsorted(m5_time, side="right")
+        m15_loc = df_m15_full.index.searchsorted(m5_time, side="left")
+        h1_loc = df_h1_full.index.searchsorted(m5_time, side="left")
+        h4_loc = df_h4_full.index.searchsorted(m5_time, side="left")
 
         tf_frames = {
             "M1": df_m1_full.iloc[max(0, m1_loc-200):m1_loc],
@@ -818,7 +823,8 @@ def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3,
         df_m1_slice = tf_frames["M1"]
         order_flow = get_order_flow_bias(df_m1_slice)
 
-        # Hurst (use pre-computed from nearest H1 bar)
+        # Hurst (use pre-computed from last COMPLETED H1 bar)
+        # h1_loc is now from side="left", so h1_loc-1 is the last completed bar
         hurst = hurst_by_h1_idx.get(h1_loc - 1, 0.5) if h1_loc > 0 else 0.5
 
         market = {
