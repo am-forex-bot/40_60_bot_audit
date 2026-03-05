@@ -520,10 +520,22 @@ def main():
                         help="Walk-forward test months (default: 3)")
     parser.add_argument("--min-fold-trades", type=int, default=15,
                         help="Min trades per WF test fold (default: 15)")
+    parser.add_argument("--tp", type=int, default=None,
+                        help="Take-profit in pips (overrides default 40)")
+    parser.add_argument("--sl", type=int, default=None,
+                        help="Stop-loss in pips (overrides default 60)")
     args = parser.parse_args()
 
+    # Allow TP/SL override from CLI
+    global TP_PIPS, SL_PIPS, BREAKEVEN_WR
+    if args.tp is not None:
+        TP_PIPS = args.tp
+    if args.sl is not None:
+        SL_PIPS = args.sl
+    BREAKEVEN_WR = SL_PIPS / (TP_PIPS + SL_PIPS)
+
     print("=" * 140)
-    print("  V3 RESULT VALIDATOR — Statistical rigour check for window optimizer results")
+    print(f"  V3 RESULT VALIDATOR — Statistical rigour check ({TP_PIPS}/{SL_PIPS} TP/SL)")
     print("=" * 140)
 
     # Load checkpoints

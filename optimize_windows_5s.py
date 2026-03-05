@@ -129,6 +129,7 @@ def get_run_id(args) -> str:
         args.data_dir,
         str(args.start), str(args.end),
         str(args.slippage), str(args.min_samples),
+        str(args.tp or TP_PIPS), str(args.sl or SL_PIPS),
     ]
     return "run_" + str(abs(hash("|".join(key_parts))) % 10**8)
 
@@ -1574,7 +1575,19 @@ def main():
                         help="Max concurrent trades per pair (default: 1, bot default)")
     parser.add_argument("--lot-size", type=float, default=0.1,
                         help="Lot size per trade for USD P&L estimates (default: 0.1 = mini lot)")
+    parser.add_argument("--tp", type=int, default=None,
+                        help="Take-profit in pips (overrides default 40)")
+    parser.add_argument("--sl", type=int, default=None,
+                        help="Stop-loss in pips (overrides default 60)")
     args = parser.parse_args()
+
+    # Allow TP/SL override from CLI
+    global TP_PIPS, SL_PIPS, BREAKEVEN_WR
+    if args.tp is not None:
+        TP_PIPS = args.tp
+    if args.sl is not None:
+        SL_PIPS = args.sl
+    BREAKEVEN_WR = SL_PIPS / (TP_PIPS + SL_PIPS)
 
     # Use args values directly — no global mutation
     min_sample_size = args.min_samples
@@ -1590,7 +1603,7 @@ def main():
     strat_names = strategies if strategies else ALL_STRATEGIES
 
     print("=" * 120)
-    print("40/60 BOT — WINDOW OPTIMIZER V2 (per-pair per-window, walk-forward validated)")
+    print(f"{TP_PIPS}/{SL_PIPS} BOT — WINDOW OPTIMIZER V2 (per-pair per-window, walk-forward validated)")
     print("=" * 120)
     if strategies:
         print(f"  Strategies: {', '.join(strat_names)} (FILTERED)")
