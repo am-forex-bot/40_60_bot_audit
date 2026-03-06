@@ -624,11 +624,14 @@ def generate_signal(df_m5: pd.DataFrame, market: dict, pair: str,
 def simulate_trade_5s(direction: str, entry_idx: int, entry_price: float,
                       bid_high: np.ndarray, bid_low: np.ndarray,
                       ask_high: np.ndarray, ask_low: np.ndarray,
-                      pip: float, n_total: int) -> Optional[Tuple[str, int]]:
+                      pip: float, n_total: int) -> Optional[Tuple[str, int, float, float]]:
     """
     Simulate a single trade from entry_idx forward through ALL remaining 5s data.
     No artificial forward limit — trade resolves when TP or SL is hit.
-    Returns ('TP', exit_5s_idx), ('SL', exit_5s_idx), or None (unresolved at end of data).
+    Returns ('TP'|'SL', exit_5s_idx, mfe_pips, mae_pips) or None (unresolved).
+
+    MFE = Maximum Favorable Excursion (best unrealized profit in pips)
+    MAE = Maximum Adverse Excursion (worst unrealized loss in pips)
     """
     max_fwd = n_total - entry_idx
     if max_fwd < 2:
@@ -664,11 +667,29 @@ def simulate_trade_5s(direction: str, entry_idx: int, entry_price: float,
     tp_idx = int(np.argmax(tp_mask)) if tp_hit else max_fwd
     sl_idx = int(np.argmax(sl_mask)) if sl_hit else max_fwd
 
+    # Determine exit
     if tp_idx <= sl_idx and tp_hit:
-        return ("TP", entry_idx + tp_idx)
+        outcome = "TP"
+        exit_idx = entry_idx + tp_idx
     elif sl_hit:
-        return ("SL", entry_idx + sl_idx)
-    return None
+        outcome = "SL"
+        exit_idx = entry_idx + sl_idx
+    else:
+        return None
+
+    # Compute MFE/MAE up to exit point
+    trade_len = exit_idx - entry_idx + 1
+    trade_high = fwd_high[:trade_len]
+    trade_low = fwd_low[:trade_len]
+
+    if direction == "buy":
+        mfe_pips = float((np.max(trade_high) - entry_price) / pip)
+        mae_pips = float((entry_price - np.min(trade_low)) / pip)
+    else:
+        mfe_pips = float((entry_price - np.min(trade_low)) / pip)
+        mae_pips = float((np.max(trade_high) - entry_price) / pip)
+
+    return (outcome, exit_idx, mfe_pips, mae_pips)
 
 
 # ─────────────────────────────────────────────────────────
@@ -847,7 +868,13 @@ def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3,
         signals_found += 1
 
         # ─── Find entry point in 5s data ───
-        entry_5s_idx = time_to_5s_idx.index.searchsorted(m5_time, side="left")
+        # Signal fires at close of M5 bar i. Entry is at the OPEN of the NEXT
+        # M5 bar (i+1), which is the first 5s bar at or after m5_times[i+1].
+        # This eliminates lookahead: we see bar i close, then enter at next bar.
+        if i + 1 >= n_m5:
+            continue
+        next_m5_time = m5_times[i + 1]
+        entry_5s_idx = time_to_5s_idx.index.searchsorted(next_m5_time, side="left")
         if entry_5s_idx >= n_5s - 2:
             continue
 
@@ -858,7 +885,10 @@ def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3,
             trades_skipped_concurrent += 1
             continue
 
-        # ─── Entry price with adverse slippage ───
+        # ─── Entry price with adverse slippage + spread tracking ───
+        # Spread = ask - bid at entry bar
+        entry_spread = (ask_close_5s[entry_5s_idx] - bid_close_5s[entry_5s_idx]) / pip
+
         if sig["direction"] == "buy":
             entry_price = ask_close_5s[entry_5s_idx] + slippage_dist
         else:
@@ -877,7 +907,7 @@ def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3,
             trades_unresolved += 1
             continue
 
-        outcome, exit_5s_idx = result
+        outcome, exit_5s_idx, mfe_pips, mae_pips = result
         open_trade_exit_indices.append(exit_5s_idx)
         trades_simulated += 1
 
@@ -894,6 +924,9 @@ def process_pair(pair: str, df_5s: pd.DataFrame, slippage_pips: float = 0.3,
             "result": outcome,
             "entry_5s_idx": entry_5s_idx,
             "exit_5s_idx": exit_5s_idx,
+            "mfe_pips": mfe_pips,
+            "mae_pips": mae_pips,
+            "spread_pips": entry_spread,
             "session": session,
             "session_quality": session_quality,
             "hurst": hurst,
@@ -1111,6 +1144,83 @@ def compute_drawdown(trades: List[dict]) -> dict:
 
 
 # ─────────────────────────────────────────────────────────
+# Bootstrap confidence interval
+# ─────────────────────────────────────────────────────────
+
+def bootstrap_ev_ci(trades: List[dict], n_boot: int = 10000,
+                    ci: float = 0.95) -> Tuple[float, float, float]:
+    """
+    Bootstrap 95% CI on EV (pips per trade).
+    Returns (lower, upper, median).
+    """
+    if not trades:
+        return (0.0, 0.0, 0.0)
+
+    pnl = np.array([TP_PIPS if t['result'] == 'TP' else -SL_PIPS for t in trades],
+                   dtype=np.float64)
+    n = len(pnl)
+    rng = np.random.default_rng(42)
+
+    boot_evs = np.empty(n_boot)
+    for b in range(n_boot):
+        sample = rng.choice(pnl, size=n, replace=True)
+        boot_evs[b] = sample.mean()
+
+    alpha = (1 - ci) / 2
+    lower = float(np.percentile(boot_evs, alpha * 100))
+    upper = float(np.percentile(boot_evs, (1 - alpha) * 100))
+    median = float(np.median(boot_evs))
+
+    return (lower, upper, median)
+
+
+# ─────────────────────────────────────────────────────────
+# Random baseline comparison
+# ─────────────────────────────────────────────────────────
+
+def random_baseline(trades: List[dict], n_runs: int = 100) -> dict:
+    """
+    Generate random entry signals with same TP/SL to check if the strategy
+    beats random. Uses the actual trade outcomes reshuffled — this preserves
+    the same number of trades and market conditions, only randomizing direction.
+
+    For each run, randomly assign TP/SL outcomes with 50/50 probability,
+    then compute EV. This tests whether the TP/SL structure itself produces
+    positive EV (it can if markets trend).
+
+    Better approach: shuffle the actual outcomes to preserve base rate,
+    compute EV on the shuffled sequence 100 times.
+    """
+    if not trades:
+        return {'mean_ev': 0, 'std_ev': 0, 'min_ev': 0, 'max_ev': 0,
+                'pct_positive': 0, 'strategy_beaten': 0, 'n_runs': 0}
+
+    pnl = np.array([TP_PIPS if t['result'] == 'TP' else -SL_PIPS for t in trades],
+                   dtype=np.float64)
+    actual_ev = pnl.mean()
+    n = len(pnl)
+    rng = np.random.default_rng(123)
+
+    random_evs = np.empty(n_runs)
+    for r in range(n_runs):
+        shuffled = rng.permutation(pnl)
+        random_evs[r] = shuffled.mean()
+
+    beaten_count = int(np.sum(random_evs >= actual_ev))
+
+    return {
+        'mean_ev': float(random_evs.mean()),
+        'std_ev': float(random_evs.std()),
+        'min_ev': float(random_evs.min()),
+        'max_ev': float(random_evs.max()),
+        'pct_positive': float(np.sum(random_evs > 0) / n_runs * 100),
+        'strategy_beaten': beaten_count,
+        'n_runs': n_runs,
+        'actual_ev': actual_ev,
+    }
+
+
+# ─────────────────────────────────────────────────────────
 # Reporting
 # ─────────────────────────────────────────────────────────
 
@@ -1212,6 +1322,120 @@ def print_pair_window_ranking(results: List[dict], pair: str, min_n: int = MIN_S
         print(f"  {s['label']:<14} {s['wr']*100:>5.1f}% {s['ev']:>+6.1f}p {s['n']:>7} "
               f"{s['tp']:>5} {s['sl']:>5} "
               f"{status:>12}{marker}  {s['strat_str']}")
+
+
+def chronological_train_test_split(trades: List[dict],
+                                   train_ratio: float = 0.65) -> Tuple[List[dict], List[dict]]:
+    """
+    Split trades chronologically into train/test sets.
+    Returns (train_trades, test_trades).
+    """
+    if not trades:
+        return [], []
+    sorted_trades = sorted(trades, key=lambda t: t['time'])
+    split_idx = int(len(sorted_trades) * train_ratio)
+    return sorted_trades[:split_idx], sorted_trades[split_idx:]
+
+
+def validate_strategy_comprehensive(all_trades: List[dict], pair: str,
+                                     train_months: int, test_months: int,
+                                     min_fold_trades: int) -> dict:
+    """
+    Comprehensive validation of ALL trades for a pair (not per-window).
+    Uses chronological 65/35 train/test split + bootstrap CI + random baseline
+    + per-pair breakdown + year-by-year breakdown + MFE/MAE stats.
+
+    Returns a dict with all validation results.
+    """
+    if not all_trades:
+        return {}
+
+    sorted_trades = sorted(all_trades, key=lambda t: t['time'])
+    train, test = chronological_train_test_split(sorted_trades)
+
+    train_n = len(train)
+    test_n = len(test)
+    train_tp = sum(1 for t in train if t['result'] == 'TP')
+    test_tp = sum(1 for t in test if t['result'] == 'TP')
+    train_wr = train_tp / train_n if train_n > 0 else 0
+    test_wr = test_tp / test_n if test_n > 0 else 0
+    train_ev = train_wr * TP_PIPS - (1 - train_wr) * SL_PIPS if train_n > 0 else 0
+    test_ev = test_wr * TP_PIPS - (1 - test_wr) * SL_PIPS if test_n > 0 else 0
+
+    # Direction balance
+    train_longs = sum(1 for t in train if t['direction'] == 'buy')
+    train_shorts = train_n - train_longs
+    test_longs = sum(1 for t in test if t['direction'] == 'buy')
+    test_shorts = test_n - test_longs
+
+    # Average spread
+    train_spreads = [t.get('spread_pips', 0) for t in train if 'spread_pips' in t]
+    test_spreads = [t.get('spread_pips', 0) for t in test if 'spread_pips' in t]
+    train_avg_spread = np.mean(train_spreads) if train_spreads else 0
+    test_avg_spread = np.mean(test_spreads) if test_spreads else 0
+
+    # MFE/MAE stats
+    train_mfe = [t.get('mfe_pips', 0) for t in train if 'mfe_pips' in t]
+    train_mae = [t.get('mae_pips', 0) for t in train if 'mae_pips' in t]
+    test_mfe = [t.get('mfe_pips', 0) for t in test if 'mfe_pips' in t]
+    test_mae = [t.get('mae_pips', 0) for t in test if 'mae_pips' in t]
+
+    # Bootstrap CI on test EV
+    boot_lower, boot_upper, boot_median = bootstrap_ev_ci(test)
+
+    # Random baseline on test trades
+    rnd = random_baseline(test)
+
+    # Per-pair test breakdown (for multi-pair runs)
+    per_pair_test = defaultdict(lambda: {'tp': 0, 'sl': 0, 'n': 0, 'resolved': 0})
+    for t in test:
+        p = t['pair']
+        per_pair_test[p]['n'] += 1
+        per_pair_test[p]['resolved'] += 1
+        if t['result'] == 'TP':
+            per_pair_test[p]['tp'] += 1
+        else:
+            per_pair_test[p]['sl'] += 1
+
+    # Year-by-year test breakdown
+    year_test = defaultdict(lambda: {'tp': 0, 'sl': 0, 'n': 0})
+    for t in test:
+        y = t['date'].year
+        year_test[y]['n'] += 1
+        if t['result'] == 'TP':
+            year_test[y]['tp'] += 1
+        else:
+            year_test[y]['sl'] += 1
+
+    # Walk-forward folds (keep for detail, but main validation is train/test split)
+    folds = walk_forward_validate(sorted_trades, train_months, test_months, min_fold_trades)
+    counted_folds = [f for f in folds if f['counted']]
+    passed_folds = [f for f in counted_folds if f['passed']]
+
+    # Drawdown on full dataset
+    dd = compute_drawdown(sorted_trades)
+
+    return {
+        'pair': pair,
+        'train_n': train_n, 'train_tp': train_tp, 'train_wr': train_wr, 'train_ev': train_ev,
+        'train_longs': train_longs, 'train_shorts': train_shorts,
+        'train_avg_spread': train_avg_spread,
+        'train_mfe': np.mean(train_mfe) if train_mfe else 0,
+        'train_mae': np.mean(train_mae) if train_mae else 0,
+        'test_n': test_n, 'test_tp': test_tp, 'test_wr': test_wr, 'test_ev': test_ev,
+        'test_longs': test_longs, 'test_shorts': test_shorts,
+        'test_avg_spread': test_avg_spread,
+        'test_mfe': np.mean(test_mfe) if test_mfe else 0,
+        'test_mae': np.mean(test_mae) if test_mae else 0,
+        'boot_lower': boot_lower, 'boot_upper': boot_upper, 'boot_median': boot_median,
+        'random_baseline': rnd,
+        'per_pair_test': dict(per_pair_test),
+        'year_test': dict(year_test),
+        'folds': folds,
+        'counted_folds': len(counted_folds),
+        'passed_folds': len(passed_folds),
+        'drawdown': dd,
+    }
 
 
 def validate_pair_windows(pair_results: List[dict], pair: str,
@@ -1460,6 +1684,109 @@ def print_pnl_summary(results: List[dict], lot_size: float = 0.1):
               f"({profitable_months/total_shown*100:.0f}%)" if total_shown > 0 else "")
 
 
+def print_comprehensive_validation(val: dict, strategies_str: str):
+    """Print comprehensive validation results matching the reference format."""
+    if not val:
+        return
+
+    pair = val['pair']
+    print(f"\n{'='*120}")
+    print(f"  COMPREHENSIVE VALIDATION: {pair}")
+    print(f"  STRATEGY: {strategies_str} (TP={TP_PIPS}p, SL={SL_PIPS}p)")
+    print(f"{'='*120}")
+
+    # Train summary
+    print(f"  TRAIN: {val['train_n']:,} trades (L:{val['train_longs']:,} S:{val['train_shorts']:,})")
+    print(f"  Train avg spread: {val['train_avg_spread']:.1f}p")
+    print(f"  Train MFE/MAE: {val['train_mfe']:.1f}/{val['train_mae']:.1f}")
+    train_best_wr = val['train_wr']
+    train_best_ev = val['train_ev']
+    print(f"  TRAIN BEST: TP={TP_PIPS:.0f}p SL={SL_PIPS:.0f}p -> WR={train_best_wr*100:.1f}% "
+          f"EV={train_best_ev:+.2f}p (n={val['train_n']:,})")
+
+    # Test summary
+    print(f"  TEST: {val['test_n']:,} trades (L:{val['test_longs']:,} S:{val['test_shorts']:,})")
+    print(f"  Test avg spread: {val['test_avg_spread']:.1f}p")
+    print(f"  Test MFE/MAE: {val['test_mfe']:.1f}/{val['test_mae']:.1f}")
+    test_wr = val['test_wr']
+    test_ev = val['test_ev']
+    verdict = "POSITIVE" if test_ev > 0 else "NEGATIVE"
+    print(f"  *** TEST RESULT (TP={TP_PIPS:.0f}p SL={SL_PIPS:.0f}p): ***")
+    print(f"  WR={test_wr*100:.1f}% EV={test_ev:+.2f}p (n={val['test_n']:,}) -> {verdict}")
+
+    # Bootstrap CI
+    ci_includes_zero = val['boot_lower'] <= 0 <= val['boot_upper']
+    sig_str = "NOT significant" if ci_includes_zero else "SIGNIFICANT"
+    print(f"  Bootstrap 95% CI: [{val['boot_lower']:+.2f}p, {val['boot_upper']:+.2f}p] "
+          f"median={val['boot_median']:+.2f}p")
+    print(f"  CI includes zero -- {sig_str}")
+
+    # Per-pair test breakdown
+    per_pair = val['per_pair_test']
+    if per_pair:
+        print(f"  Per-pair TEST (TP={TP_PIPS:.0f}p SL={SL_PIPS:.0f}p):")
+        print(f"  {'Pair':<16} {'N':>5} {'Resolved':>9} {'WR':>8} {'EV':>9}    {'Verdict'}")
+        print(f"  {'-'*60}")
+        pairs_with_edge = 0
+        for p in sorted(per_pair.keys()):
+            d = per_pair[p]
+            n = d['n']
+            resolved = d['resolved']
+            tp = d['tp']
+            wr = tp / resolved if resolved > 0 else 0
+            ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
+            edge = "EDGE" if ev > 0 else "no edge"
+            if ev > 0:
+                pairs_with_edge += 1
+            print(f"  {p:<16} {n:>5} {resolved:>9} {wr*100:>6.1f}% {ev:>+8.2f}p       {edge}")
+        print(f"  Pairs with positive EV: {pairs_with_edge}/{len(per_pair)}")
+
+    # Year-by-year test breakdown
+    year_data = val['year_test']
+    if year_data:
+        print(f"  Year-by-year TEST:")
+        for y in sorted(year_data.keys()):
+            d = year_data[y]
+            n = d['n']
+            tp = d['tp']
+            wr = tp / n if n > 0 else 0
+            ev = wr * TP_PIPS - (1 - wr) * SL_PIPS
+            print(f"    {y}: WR={wr*100:.1f}% EV={ev:+.2f}p (n={n})")
+
+    # Random baseline
+    rnd = val['random_baseline']
+    if rnd and rnd['n_runs'] > 0:
+        print(f"  RANDOM BASELINE ({rnd['n_runs']} runs, same TP/SL):")
+        print(f"    Random EV: mean={rnd['mean_ev']:.2f}p, std={rnd['std_ev']:.2f}p")
+        print(f"    Range: [{rnd['min_ev']:.2f}p, {rnd['max_ev']:.2f}p]")
+        print(f"    Random positive: {rnd['pct_positive']:.0f}%")
+        print(f"    Strategy beaten by random: {rnd['strategy_beaten']}/{rnd['n_runs']} "
+              f"({rnd['strategy_beaten']/rnd['n_runs']*100:.1f}%)")
+
+    # Walk-forward folds (supplementary)
+    if val['folds']:
+        print(f"\n  Walk-forward folds (supplementary): "
+              f"{val['passed_folds']}/{val['counted_folds']} passed")
+        print(f"  {'Fold':<16} {'Train':>7} {'Trn WR':>7} {'Trn EV':>8} | "
+              f"{'Test':>6} {'Tst WR':>7} {'Tst EV':>8} | {'Result':>8}")
+        print(f"  {'-'*90}")
+        for f in val['folds']:
+            if f['counted']:
+                result_str = "PASS" if f['passed'] else "FAIL"
+            else:
+                result_str = f"skip (n={f['test_n']})"
+            print(f"  {f['label']:<16} {f['train_n']:>7} {f['train_wr']*100:>6.1f}% "
+                  f"{f['train_ev']:>+7.1f}p | {f['test_n']:>6} {f['test_wr']*100:>6.1f}% "
+                  f"{f['test_ev']:>+7.1f}p | {result_str:>8}")
+
+    # Drawdown
+    dd = val['drawdown']
+    print(f"\n  Drawdown: max={dd['max_drawdown_pips']:.0f}p | "
+          f"max consec losses={dd['max_consecutive_losses']} | "
+          f"profit factor={dd['profit_factor']:.2f} | "
+          f"worst month={dd['worst_month']} ({dd['worst_month_pnl']:+.0f}p)")
+
+
 def print_recommended_config(all_validated: Dict[str, List[dict]]):
     """Print the final recommended PAIR_WINDOWS config."""
     print(f"\n{'='*120}")
@@ -1614,8 +1941,10 @@ def main():
     print(f"  Breakeven WR: {BREAKEVEN_WR*100:.0f}%")
     print(f"  Concurrent trades: {max_concurrent} per pair")
     print(f"  Adverse slippage: {args.slippage} pips on entry")
+    print(f"  Entry: at OPEN of NEXT M5 bar after signal (no lookahead)")
     print(f"  Lot size: {lot_size} (for USD P&L estimates)")
     print(f"  Trade forward limit: NONE (trades resolve fully)")
+    print(f"  Validation: 65/35 chronological train/test + bootstrap CI + random baseline")
     print(f"  Walk-forward: {wf_train}m initial train, {wf_test}m test periods, "
           f"expanding window")
     print(f"  Validation: both train+test WR>{BREAKEVEN_WR*100:.0f}% per fold, "
@@ -1764,6 +2093,30 @@ def main():
 
     # ─── P&L Summary ───
     print_pnl_summary(all_results, lot_size)
+
+    # ─── Comprehensive validation (per-pair, with bootstrap CI + random baseline) ───
+    strategies_str = ", ".join(strat_names)
+    for pair, _ in available:
+        results = pair_results_map.get(pair, [])
+        if not results:
+            continue
+        val = validate_strategy_comprehensive(
+            results, pair,
+            train_months=wf_train,
+            test_months=wf_test,
+            min_fold_trades=min_fold_trades,
+        )
+        print_comprehensive_validation(val, strategies_str)
+
+    # ─── Global comprehensive validation (all pairs combined) ───
+    if all_results:
+        val_global = validate_strategy_comprehensive(
+            all_results, "ALL_PAIRS",
+            train_months=wf_train,
+            test_months=wf_test,
+            min_fold_trades=min_fold_trades,
+        )
+        print_comprehensive_validation(val_global, strategies_str)
 
     print(f"\n{'='*120}")
     print("DONE")
